@@ -1,0 +1,29 @@
+# go2rtc example config — the app generates the real config/go2rtc.yaml from the
+# cameras in the database. This file documents the shape and Hikvision specifics.
+
+api:
+  listen: ":1984"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555"
+  # For remote/Tailscale access, add your candidates here, e.g.:
+  # candidates:
+  #   - 100.x.y.z:8555   # tailscale IP
+
+streams:
+  # Hikvision main stream (recording + high-quality live). Channel 101 = main.
+  front_door:
+    - rtsp://CAMUSER:CAMPASS@192.168.1.64:554/Streaming/Channels/101
+
+  # Substream (detection + low-bandwidth live). Channel 102 = sub.
+  front_door_sub:
+    - rtsp://CAMUSER:CAMPASS@192.168.1.64:554/Streaming/Channels/102
+
+  # Repeat per camera (driveway, backyard, garage, ...). The app fills these in.
+  # driveway:
+  #   - rtsp://CAMUSER:CAMPASS@192.168.1.65:554/Streaming/Channels/101
+  # driveway_sub:
+  #   - rtsp://CAMUSER:CAMPASS@192.168.1.65:554/Streaming/Channels/102

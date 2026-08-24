@@ -1,0 +1,22 @@
+{
+  "name": "Argus NVR",
+  "short_name": "Argus",
+  "description": "Self-hosted network video recorder",
+  "start_url": "/live",
+  "display": "standalone",
+  "background_color": "#090c12",
+  "theme_color": "#090c12",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    { "name": "Live View", "url": "/live", "description": "Watch live camera feeds" },
+    { "name": "Events", "url": "/events", "description": "Browse motion events" }
+  ]
+}

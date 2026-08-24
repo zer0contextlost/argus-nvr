@@ -1,0 +1,24 @@
+[Unit]
+Description=Argus NVR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=argus
+Group=argus
+WorkingDirectory=/opt/argus/app
+Environment=ARGUS_ENV_FILE=/etc/argus/.env
+ExecStart=/opt/argus/app/venv/bin/python -m uvicorn sentinel.main:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/opt/argus/logs/stdout.log
+StandardError=append:/opt/argus/logs/stderr.log
+
+# Light hardening — full hardening can break ffmpeg/go2rtc subprocess spawning
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/argus /etc/argus
+
+[Install]
+WantedBy=multi-user.target

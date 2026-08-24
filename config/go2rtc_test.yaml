@@ -1,0 +1,11 @@
+﻿api:
+  listen: :1984
+log:
+  level: debug
+rtsp:
+  listen: :8554
+streams:
+  test_cam:
+  - exec:F:\sentinel\tools\ffmpeg\bin\ffmpeg.exe -re -f lavfi -i testsrc=size=640x480:rate=25 -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -f rtsp rtsp://localhost:8554/test_cam
+webrtc:
+  listen: :8555

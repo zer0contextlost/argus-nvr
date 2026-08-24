@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "argus-nvr"
+version = "1.0.0"
+description = "Self-hosted NVR for IP cameras"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+argus = "sentinel.main:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel*"]

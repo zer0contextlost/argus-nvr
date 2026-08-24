@@ -1,0 +1,15 @@
+# Sentinel NVR — optional face recognition extras
+# Install with: pip install -r requirements-face.txt
+# Adds ~500 MB of packages; requires a 64-bit Python 3.11 build.
+
+insightface==1.0.1
+mediapipe==0.10.35
+onnxruntime==1.20.1
+opencv-contrib-python==4.13.0.92
+
+# Transitive deps pulled in by the above (pinned for reproducibility)
+absl-py==2.4.0
+flatbuffers==25.12.19
+matplotlib==3.10.9
+ml_dtypes==0.5.4
+sounddevice==0.5.5
