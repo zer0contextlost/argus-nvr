@@ -13,6 +13,7 @@ Sending requires `pywebpush` to be installed: pip install pywebpush
 
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,16 +28,34 @@ router = APIRouter(prefix="/webpush", tags=["webpush"])
 
 _VAPID_PRIVATE_KEY = "vapid_private_key"
 _VAPID_PUBLIC_KEY = "vapid_public_key"
+_vapid_lock = threading.Lock()
 
 
 def _ensure_vapid_keys() -> tuple[str, str]:
-    """Return (private_key_b64, public_key_b64), generating them on first call."""
+    """Return (private_key_b64, public_key_b64), generating them on first call.
+
+    Locked so two concurrent first-callers (e.g. multiple uvicorn workers, or
+    two requests landing on the same await point) can't each generate a
+    different keypair and race to write it — the loser's browser subscribers
+    would end up signed with a VAPID key nobody kept.
+    """
     db = get_db()
     pub_row = db.execute("SELECT value FROM settings WHERE key=?", (_VAPID_PUBLIC_KEY,)).fetchone()
     prv_row = db.execute("SELECT value FROM settings WHERE key=?", (_VAPID_PRIVATE_KEY,)).fetchone()
     if pub_row and prv_row and pub_row["value"] and prv_row["value"]:
         return prv_row["value"], pub_row["value"]
 
+    with _vapid_lock:
+        # Re-check now that we hold the lock — another thread may have
+        # generated and committed keys while we were waiting for it.
+        pub_row = db.execute("SELECT value FROM settings WHERE key=?", (_VAPID_PUBLIC_KEY,)).fetchone()
+        prv_row = db.execute("SELECT value FROM settings WHERE key=?", (_VAPID_PRIVATE_KEY,)).fetchone()
+        if pub_row and prv_row and pub_row["value"] and prv_row["value"]:
+            return prv_row["value"], pub_row["value"]
+        return _generate_and_store_vapid_keys(db)
+
+
+def _generate_and_store_vapid_keys(db) -> tuple[str, str]:
     try:
         from py_vapid import Vapid
         v = Vapid()

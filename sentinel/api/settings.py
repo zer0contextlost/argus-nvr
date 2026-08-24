@@ -63,8 +63,6 @@ _ALLOWED_KEYS: frozenset[str] = frozenset({
     "cloud_backup_schedule",
     # Web Push / PWA
     "webpush_enabled",
-    # Two-way audio
-    "two_way_audio_enabled",
     # ONVIF output
     "onvif_output_enabled",
     "onvif_output_port",
