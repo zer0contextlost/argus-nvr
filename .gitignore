@@ -2,6 +2,9 @@
 .env
 *.env.local
 
+# ── Tests (stale fixtures predating later migrations/renames — not maintained) ─
+/tests/
+
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
