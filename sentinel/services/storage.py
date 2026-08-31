@@ -96,10 +96,16 @@ def _check_interval() -> float:
 
 
 def _recordings_drive() -> Path:
-    """The root path whose disk usage we monitor (the F: drive root)."""
-    root = settings.sentinel_recordings_dir
-    # Walk up to the drive root on Windows (e.g. F:\), or use root on POSIX.
-    return Path(root.anchor)
+    """The path whose filesystem disk usage we monitor.
+
+    shutil.disk_usage() resolves to the containing filesystem for any
+    existing path on both POSIX and Windows -- no need to walk up to a
+    mount/drive root. The previous Path(root.anchor) implementation
+    returned '/' for every POSIX path, silently reporting root-filesystem
+    stats instead of the actual recordings volume whenever recordings live
+    on a separate mount (e.g. a bind-mounted data disk).
+    """
+    return settings.sentinel_recordings_dir
 
 
 def _disk_usage() -> shutil.usage_result:

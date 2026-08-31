@@ -53,6 +53,10 @@ def _safe_event_path(path_str: str) -> Path:
 log = get_logger("sentinel.api.events")
 router = APIRouter(prefix="/events", tags=["events"])
 
+# The /ws route lives on its own router (see bottom of file) mounted WITHOUT
+# the app-wide auth dependency — see events_websocket() for why.
+ws_router = APIRouter(prefix="/events", tags=["events"])
+
 
 # ---------------------------------------------------------------------------
 # Serialiser
@@ -274,7 +278,7 @@ async def update_detect_zone(camera_id: int, body: DetectZoneUpdate) -> dict:
 # WebSocket live event stream
 # ---------------------------------------------------------------------------
 
-@router.websocket("/ws")
+@ws_router.websocket("/ws")
 async def events_websocket(websocket: WebSocket, token: str = ""):
     """
     WebSocket endpoint that streams live motion events to the browser.
@@ -282,6 +286,16 @@ async def events_websocket(websocket: WebSocket, token: str = ""):
     Auth: pass the JWT token as a query parameter:
       ws://host/api/events/ws?token=<bearer-token>
     Browser WebSocket API cannot send custom headers, so we use a query param.
+
+    This route is intentionally NOT on `router` above: `router` is mounted in
+    main.py with the app-wide `Depends(get_current_user_flexible)` dependency,
+    which pulls in fastapi.security.HTTPBearer. HTTPBearer's __call__ requires
+    an HTTP Request, which FastAPI cannot supply when solving dependencies for
+    a WebSocket route — every connection would crash with
+    "TypeError: HTTPBearer.__call__() missing 1 required positional
+    argument: 'request'" before this function's own token check below ever
+    ran. So this route lives on `ws_router`, mounted without that dependency,
+    and does its own auth via the query-param token instead.
 
     The client receives JSON messages:
       {"type": "motion_start", "event_id": ..., "camera_id": ..., "started_at": ...}

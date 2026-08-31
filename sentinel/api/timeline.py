@@ -148,6 +148,13 @@ async def get_timeline(
     # finalized (no moov atom → unplayable). Since segments are ~2 minutes,
     # the currently-recording segment is at most a couple minutes old; older
     # NULL-ended_at rows are ghosts and should not appear on the timeline.
+    #
+    # Use strftime() with our own started_at format (not datetime(), which
+    # renders "YYYY-MM-DD HH:MM:SS" with a space) — started_at is stored as
+    # "YYYY-MM-DDTHH:MM:SSZ", and 'T' > ' ' lexicographically, so comparing
+    # against datetime('now', ...)'s space-separated string made every
+    # same-day row pass regardless of actual age (a 19-hour-old ghost row
+    # would pass a "last 5 minutes" filter).
     seg_rows = db.execute(
         """
         SELECT id, path, started_at, ended_at, duration_s, has_gap
@@ -158,7 +165,7 @@ async def get_timeline(
                   ended_at > ?
                OR (ended_at IS NULL
                    AND started_at >= ?
-                   AND started_at >= datetime('now', '-5 minutes'))
+                   AND started_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-5 minutes'))
               )
         ORDER  BY started_at
         """,
@@ -260,7 +267,7 @@ async def get_recording_thumbnail(
           AND (size_bytes IS NULL OR size_bytes >= 4096)
           AND (
                 ended_at >= ?
-             OR (ended_at IS NULL AND started_at >= datetime('now', '-5 minutes'))
+             OR (ended_at IS NULL AND started_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-5 minutes'))
               )
         ORDER BY started_at ASC LIMIT 1
         """,
@@ -509,6 +516,12 @@ async def export_clip(body: ExportRequest):
     cam_name = re.sub(r"[':,\\=\[\]]", "", cam_name)
     wm_text = re.sub(r"[':,\\=\[\]]", "", body.watermark_text or cam_name)
 
+    # Cap concurrent FFmpeg exports at 2 so recording processes keep CPU priority.
+    # Checked before creating tmp_dir below so a 429 here doesn't leak one.
+    if _export_sem._value == 0:  # type: ignore[attr-defined]
+        raise HTTPException(status_code=429, detail="Too many concurrent exports — try again shortly")
+    await _export_sem.acquire()
+
     # Temp directory for output on the same drive as recordings to avoid
     # filling the system (C:) drive with large MP4 clips.
     tmp_dir = tempfile.mkdtemp(
@@ -516,11 +529,6 @@ async def export_clip(body: ExportRequest):
         dir=str(settings.sentinel_recordings_dir),
     )
     out_path = Path(tmp_dir) / "clip.mp4"
-
-    # Cap concurrent FFmpeg exports at 2 so recording processes keep CPU priority.
-    if _export_sem._value == 0:  # type: ignore[attr-defined]
-        raise HTTPException(status_code=429, detail="Too many concurrent exports — try again shortly")
-    await _export_sem.acquire()
 
     # When watermark is on we must re-encode (drawtext filter requires it).
     # Use fast libx264 so export isn't painfully slow.
@@ -530,6 +538,11 @@ async def export_clip(body: ExportRequest):
         if body.watermark else ""
     )
 
+    # NOTE: the whole body below is one try/except/finally so that ANY failure
+    # — including subprocess.TimeoutExpired, which used to propagate straight
+    # out of this function — reaches the tmp_dir cleanup below instead of
+    # leaking the temp directory (and, for a watermark re-encode, a
+    # partially-written clip) on disk forever.
     try:
         if len(segments) == 1:
             seg = segments[0]
@@ -556,7 +569,12 @@ async def export_clip(body: ExportRequest):
                     str(out_path),
                 ]
             log.info("export single-seg watermark=%s: %s", body.watermark, " ".join(cmd))
-            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            # subprocess.run() blocks its calling thread for the full FFmpeg
+            # duration (up to the timeout below) — run it off the event loop
+            # so it doesn't freeze all other API/WebSocket traffic meanwhile.
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: subprocess.run(cmd, capture_output=True, timeout=120)
+            )
         else:
             # Multi-segment: write a concat list then use concat demuxer.
             concat_list = Path(tmp_dir) / "list.txt"
@@ -585,11 +603,10 @@ async def export_clip(body: ExportRequest):
                     str(out_path),
                 ]
             log.info("export multi-seg watermark=%s: %s segments", body.watermark, len(segments))
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
-    finally:
-        _export_sem.release()
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: subprocess.run(cmd, capture_output=True, timeout=300)
+            )
 
-    try:
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace")
             log.error("ffmpeg export failed: %s", stderr[-2000:])
@@ -638,6 +655,8 @@ async def export_clip(body: ExportRequest):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         log.error("export error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        _export_sem.release()
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +738,12 @@ async def generate_timelapse(body: TimelapseRequest):
             "-movflags", "+faststart",
             str(out_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        # subprocess.run() blocks its calling thread for the full FFmpeg
+        # duration — run it off the event loop so a timelapse job doesn't
+        # freeze all other API/WebSocket traffic for up to five minutes.
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: subprocess.run(cmd, capture_output=True, timeout=300)
+        )
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace")
             raise HTTPException(status_code=500, detail=f"FFmpeg failed: {stderr[-400:]}")

@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Optional
 
 from sentinel.config import settings
-from sentinel.db import get_db
+from sentinel.db import get_db, open_db
 from sentinel.services.supervisor import ProcessSupervisor, RestartPolicy
 from sentinel.util.hikvision import build_go2rtc_stream_name
 from sentinel.util.logging import get_logger
@@ -77,6 +77,12 @@ POLL_INTERVAL_S: float = 2.0
 # the consumer open through brief lulls collapses the churn into one stable
 # connection per camera.
 RECORDER_LINGER_S: float = 90.0
+
+# How often (seconds) to age-prune the pre-buffer directory while it runs
+# unattended (no motion opening the gate). Kept short relative to typical
+# motion_pre_buffer_seconds settings so the on-disk window stays tight even
+# through a long motion-free stretch.
+PREBUFFER_HOUSEKEEPING_INTERVAL_S: float = 30.0
 
 # ---------------------------------------------------------------------------
 # Module-level registry: camera_id -> CameraRecorder
@@ -188,6 +194,16 @@ class SegmentIndexer:
         self._seen_order: list[Path] = []  # ordered list of files seen so far
         self._pending_gap: bool = False    # set True when a gap is detected at (re)start
 
+        # Dedicated connection — this indexer runs its own thread, so it must
+        # not share the main event-loop connection from get_db() (multiple
+        # indexer threads interleaving BEGIN/COMMIT on one shared sqlite3
+        # connection corrupts that connection's transaction state). Also
+        # touched by the supervisor's restart-watchdog thread via
+        # notify_restart(), so guard it with a lock rather than assuming
+        # single-threaded access.
+        self._db = open_db()
+        self._db_lock = threading.Lock()
+
         # Pre-populate from what's already been indexed in the DB so we don't
         # double-insert on app restart.
         self._preload_indexed()
@@ -195,7 +211,6 @@ class SegmentIndexer:
     def _preload_indexed(self) -> None:
         try:
             from datetime import timedelta
-            db = get_db()
             # Load only paths from the last 30 days (matching the default retention
             # window) so the set stays bounded even on long-running deployments.
             # INSERT OR IGNORE in _insert_segment handles the rare case where an
@@ -203,10 +218,11 @@ class SegmentIndexer:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
-            rows = db.execute(
-                "SELECT path FROM recordings WHERE camera_id=? AND started_at >= ?",
-                (self.camera_id, cutoff),
-            ).fetchall()
+            with self._db_lock:
+                rows = self._db.execute(
+                    "SELECT path FROM recordings WHERE camera_id=? AND started_at >= ?",
+                    (self.camera_id, cutoff),
+                ).fetchall()
             for r in rows:
                 self._indexed.add(Path(r["path"]))
         except Exception as exc:
@@ -227,98 +243,99 @@ class SegmentIndexer:
         and polluting the timeline / Events / Playback UI with un-loadable
         recordings.
         """
-        try:
-            db = get_db()
-            rows = db.execute(
-                "SELECT id, path, started_at FROM recordings "
-                "WHERE camera_id=? AND ended_at IS NULL",
-                (self.camera_id,),
-            ).fetchall()
-        except Exception as exc:
-            log.warning("[indexer cam=%s] stuck-cleanup query error: %s", self.camera_id, exc)
-            return
-
-        if not rows:
-            return
-
-        purged = 0
-        closed = 0
-        for r in rows:
-            rid = r["id"]
-            path = Path(r["path"])
-
-            if not path.exists():
-                try:
-                    db.execute("DELETE FROM recordings WHERE id=?", (rid,))
-                    db.commit()
-                    self._indexed.discard(path)
-                    purged += 1
-                except Exception as exc:
-                    log.warning("[indexer cam=%s] could not purge missing-file row %s: %s",
-                                self.camera_id, rid, exc)
-                continue
-
+        with self._db_lock:
+            db = self._db
             try:
-                size = path.stat().st_size
-            except OSError:
-                size = 0
-
-            playable = False
-            if size >= 4096:
-                try:
-                    with open(path, "rb") as fh:
-                        head = fh.read(min(512 * 1024, size))
-                    playable = b"moov" in head
-                except OSError:
-                    playable = False
-
-            if not playable:
-                # Unplayable — delete file + DB row.
-                try:
-                    if path.exists():
-                        path.unlink()
-                except OSError as exc:
-                    log.warning("[indexer cam=%s] could not delete unplayable %s: %s",
-                                self.camera_id, path, exc)
-                try:
-                    db.execute("DELETE FROM recordings WHERE id=?", (rid,))
-                    db.commit()
-                    self._indexed.discard(path)
-                    purged += 1
-                except Exception as exc:
-                    log.warning("[indexer cam=%s] could not delete DB row %s: %s",
-                                self.camera_id, rid, exc)
-                continue
-
-            # Playable — close the row using mtime as ended_at.
-            try:
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-            except OSError:
-                mtime = datetime.now(timezone.utc)
-
-            started_at_dt = None
-            try:
-                started_at_dt = datetime.strptime(
-                    r["started_at"], "%Y-%m-%dT%H:%M:%SZ"
-                ).replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                pass
-
-            if started_at_dt is not None:
-                duration_s = max(0.0, (mtime - started_at_dt).total_seconds())
-            else:
-                duration_s = None
-
-            try:
-                db.execute(
-                    "UPDATE recordings SET ended_at=?, duration_s=?, size_bytes=? WHERE id=?",
-                    (_iso(mtime), duration_s, size, rid),
-                )
-                db.commit()
-                closed += 1
+                rows = db.execute(
+                    "SELECT id, path, started_at FROM recordings "
+                    "WHERE camera_id=? AND ended_at IS NULL",
+                    (self.camera_id,),
+                ).fetchall()
             except Exception as exc:
-                log.warning("[indexer cam=%s] could not close row %s: %s",
-                            self.camera_id, rid, exc)
+                log.warning("[indexer cam=%s] stuck-cleanup query error: %s", self.camera_id, exc)
+                return
+
+            if not rows:
+                return
+
+            purged = 0
+            closed = 0
+            for r in rows:
+                rid = r["id"]
+                path = Path(r["path"])
+
+                if not path.exists():
+                    try:
+                        db.execute("DELETE FROM recordings WHERE id=?", (rid,))
+                        db.commit()
+                        self._indexed.discard(path)
+                        purged += 1
+                    except Exception as exc:
+                        log.warning("[indexer cam=%s] could not purge missing-file row %s: %s",
+                                    self.camera_id, rid, exc)
+                    continue
+
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+
+                playable = False
+                if size >= 4096:
+                    try:
+                        with open(path, "rb") as fh:
+                            head = fh.read(min(512 * 1024, size))
+                        playable = b"moov" in head
+                    except OSError:
+                        playable = False
+
+                if not playable:
+                    # Unplayable — delete file + DB row.
+                    try:
+                        if path.exists():
+                            path.unlink()
+                    except OSError as exc:
+                        log.warning("[indexer cam=%s] could not delete unplayable %s: %s",
+                                    self.camera_id, path, exc)
+                    try:
+                        db.execute("DELETE FROM recordings WHERE id=?", (rid,))
+                        db.commit()
+                        self._indexed.discard(path)
+                        purged += 1
+                    except Exception as exc:
+                        log.warning("[indexer cam=%s] could not delete DB row %s: %s",
+                                    self.camera_id, rid, exc)
+                    continue
+
+                # Playable — close the row using mtime as ended_at.
+                try:
+                    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                except OSError:
+                    mtime = datetime.now(timezone.utc)
+
+                started_at_dt = None
+                try:
+                    started_at_dt = datetime.strptime(
+                        r["started_at"], "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    pass
+
+                if started_at_dt is not None:
+                    duration_s = max(0.0, (mtime - started_at_dt).total_seconds())
+                else:
+                    duration_s = None
+
+                try:
+                    db.execute(
+                        "UPDATE recordings SET ended_at=?, duration_s=?, size_bytes=? WHERE id=?",
+                        (_iso(mtime), duration_s, size, rid),
+                    )
+                    db.commit()
+                    closed += 1
+                except Exception as exc:
+                    log.warning("[indexer cam=%s] could not close row %s: %s",
+                                self.camera_id, rid, exc)
 
         if purged or closed:
             log.info(
@@ -364,13 +381,13 @@ class SegmentIndexer:
         enough, set _pending_gap so the next indexed segment is flagged has_gap=1.
         """
         try:
-            db = get_db()
-            row = db.execute(
-                "SELECT ended_at FROM recordings WHERE camera_id=? "
-                "AND ended_at IS NOT NULL "
-                "ORDER BY ended_at DESC LIMIT 1",
-                (self.camera_id,),
-            ).fetchone()
+            with self._db_lock:
+                row = self._db.execute(
+                    "SELECT ended_at FROM recordings WHERE camera_id=? "
+                    "AND ended_at IS NOT NULL "
+                    "ORDER BY ended_at DESC LIMIT 1",
+                    (self.camera_id,),
+                ).fetchone()
             if row and row["ended_at"]:
                 last_end_str = row["ended_at"]
                 # Parse ISO string
@@ -468,7 +485,12 @@ class SegmentIndexer:
 
     def _index_final_segment(self) -> None:
         """
-        Index the last seen file (called at shutdown).
+        Index the last seen file. Called both at full indexer shutdown and by
+        CameraRecorder._linger_stop() after each individual motion window's
+        FFmpeg process exits — otherwise that last segment (often the most
+        relevant few minutes of the whole event) sits un-indexed and invisible
+        on the timeline/events UI until some later, unrelated file finally
+        bumps it out of _seen_order[-1] on the next _scan().
 
         If the file is tiny (< TINY_SEGMENT_MIN_BYTES) it was almost certainly
         an empty stub created by FFmpeg just before the process was terminated.
@@ -580,46 +602,47 @@ class SegmentIndexer:
         self._pending_gap = False  # reset after first insert
 
         try:
-            db = get_db()
-            cur = db.execute(
-                """
-                INSERT OR IGNORE INTO recordings
-                    (camera_id, path, started_at, ended_at, duration_s, size_bytes, has_gap)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    self.camera_id,
-                    str(path),
-                    started_at,
-                    ended_at,
-                    duration_s,
-                    size_bytes,
-                    has_gap,
-                ),
-            )
-            db.commit()
-
-            # Backfill events that fired before this segment was indexed.
-            # The detector's _find_covering_recording() runs at event-creation
-            # time, before the segment row exists, so recording_id is often
-            # NULL. Correct it now that the recording row is committed.
-            # INSERT OR IGNORE: lastrowid is 0/stale if the row already
-            # existed, so only backfill on a genuinely new insert.
-            new_rec_id = cur.lastrowid if cur.rowcount > 0 else 0
-            if new_rec_id and started_at:
-                backfill_end = ended_at or _iso(datetime.now(timezone.utc))
-                db.execute(
+            with self._db_lock:
+                db = self._db
+                cur = db.execute(
                     """
-                    UPDATE events
-                       SET recording_id = ?
-                     WHERE camera_id = ?
-                       AND recording_id IS NULL
-                       AND started_at >= ?
-                       AND started_at < ?
+                    INSERT OR IGNORE INTO recordings
+                        (camera_id, path, started_at, ended_at, duration_s, size_bytes, has_gap)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (new_rec_id, self.camera_id, started_at, backfill_end),
+                    (
+                        self.camera_id,
+                        str(path),
+                        started_at,
+                        ended_at,
+                        duration_s,
+                        size_bytes,
+                        has_gap,
+                    ),
                 )
                 db.commit()
+
+                # Backfill events that fired before this segment was indexed.
+                # The detector's _find_covering_recording() runs at event-creation
+                # time, before the segment row exists, so recording_id is often
+                # NULL. Correct it now that the recording row is committed.
+                # INSERT OR IGNORE: lastrowid is 0/stale if the row already
+                # existed, so only backfill on a genuinely new insert.
+                new_rec_id = cur.lastrowid if cur.rowcount > 0 else 0
+                if new_rec_id and started_at:
+                    backfill_end = ended_at or _iso(datetime.now(timezone.utc))
+                    db.execute(
+                        """
+                        UPDATE events
+                           SET recording_id = ?
+                         WHERE camera_id = ?
+                           AND recording_id IS NULL
+                           AND started_at >= ?
+                           AND started_at < ?
+                        """,
+                        (new_rec_id, self.camera_id, started_at, backfill_end),
+                    )
+                    db.commit()
             self._indexed.add(path)
             log.info(
                 "[indexer cam=%s] indexed %s duration=%.1fs gap=%s",
@@ -733,6 +756,14 @@ class CameraRecorder:
         self._linger_timer: Optional[threading.Timer] = None
         self._lifecycle_lock = threading.Lock()
 
+        # Periodic pre-buffer housekeeping timer: age-prunes .prebuffer segments
+        # while the pre-buffer runs unattended (no motion). _collect_prebuffer()
+        # is otherwise only invoked from open_gate(), so a camera with no motion
+        # for longer than the pre-buffer window would accumulate full-bitrate
+        # segments forever — they carry no DB row, so storage.py's space-based
+        # retention can't see them either. See PREBUFFER_HOUSEKEEPING_INTERVAL_S.
+        self._prebuffer_housekeeping_timer: Optional[threading.Timer] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -824,6 +855,14 @@ class CameraRecorder:
                 log.info("[recorder cam=%s] linger expired — stopping FFmpeg", self.camera_id)
                 self._supervisor.stop()
                 self._supervisor = None
+                # supervisor.stop() blocks until FFmpeg has fully exited, so the
+                # segment it was writing is finalized on disk — index it now
+                # instead of leaving it invisible until the next motion event.
+                try:
+                    self._indexer._index_final_segment()
+                except Exception as exc:
+                    log.warning("[recorder cam=%s] final-segment index after linger failed: %s",
+                                self.camera_id, exc)
             # Restart the pre-buffer so footage is available for the next motion event.
             if self.record_mode == "motion-only":
                 self._start_prebuffer()
@@ -896,27 +935,63 @@ class CameraRecorder:
         )
         self._prebuffer_supervisor.start()
         log.info("[recorder cam=%s] pre-buffer recorder started", self.camera_id)
+        self._schedule_prebuffer_housekeeping()
+
+    def _schedule_prebuffer_housekeeping(self) -> None:
+        """(Re)arm the periodic pre-buffer age-pruning timer."""
+        self._prebuffer_housekeeping_timer = threading.Timer(
+            PREBUFFER_HOUSEKEEPING_INTERVAL_S, self._prebuffer_housekeeping_tick
+        )
+        self._prebuffer_housekeeping_timer.daemon = True
+        self._prebuffer_housekeeping_timer.start()
+
+    def _prebuffer_housekeeping_tick(self) -> None:
+        """
+        Periodic no-motion cleanup: age-prune the pre-buffer directory the same
+        way open_gate() does on a real trigger, so a camera with no motion for
+        a long stretch doesn't accumulate full-bitrate segments indefinitely.
+        """
+        with self._lifecycle_lock:
+            if self._prebuffer_supervisor is None:
+                return  # gate opened / recorder stopped since this fired
+            try:
+                self._collect_prebuffer(include_last=False, harvest=False)
+            except Exception as exc:
+                log.warning("[recorder cam=%s] pre-buffer housekeeping failed: %s",
+                            self.camera_id, exc)
+            self._schedule_prebuffer_housekeeping()
 
     def _stop_prebuffer(self) -> None:
         """Stop the pre-buffer recorder (must be called under _lifecycle_lock or from stop())."""
+        if self._prebuffer_housekeeping_timer is not None:
+            self._prebuffer_housekeeping_timer.cancel()
+            self._prebuffer_housekeeping_timer = None
         sup = self._prebuffer_supervisor
         self._prebuffer_supervisor = None
         if sup is not None:
             sup.stop()
             log.debug("[recorder cam=%s] pre-buffer recorder stopped", self.camera_id)
 
-    def _collect_prebuffer(self, include_last: bool = False) -> None:
+    def _collect_prebuffer(self, include_last: bool = False, harvest: bool = True) -> None:
         """
-        Move recently completed pre-buffer segments into the main recordings
-        directory so the SegmentIndexer picks them up on its next scan.
-        Segments older than the pre-buffer window are deleted.
+        Age-prune the pre-buffer directory, deleting segments older than the
+        pre-buffer window.
 
-        include_last: when True, harvest every segment including the newest one.
-        Only safe once the pre-buffer FFmpeg has been stopped (see open_gate) —
-        that final chunk holds the footage right before the trigger, so dropping
-        it loses the start of the event. When False (periodic housekeeping while
-        the pre-buffer is still running), the newest file may still be open by
-        FFmpeg, so it is skipped.
+        include_last: when True, consider every segment including the newest
+        one. Only safe once the pre-buffer FFmpeg has been stopped (see
+        open_gate) — that final chunk holds the footage right before the
+        trigger, so dropping it loses the start of the event. When False
+        (periodic housekeeping while the pre-buffer is still running), the
+        newest file may still be open by FFmpeg, so it is skipped.
+
+        harvest: when True (a real motion trigger via open_gate), segments
+        still within the window are additionally moved into the main
+        recordings directory so the SegmentIndexer picks up the pre-roll
+        footage. When False (periodic no-motion housekeeping, called from
+        _prebuffer_housekeeping_tick), in-window segments are left alone —
+        promoting them into the permanent recording without any actual
+        motion would silently turn motion-only mode into continuous
+        recording.
         """
         if not self._prebuffer_dir.exists():
             return
@@ -950,6 +1025,8 @@ class CameraRecorder:
                 except OSError:
                     pass
                 continue
+            if not harvest:
+                continue  # within window, no motion — leave it in the pre-buffer
             # Within the pre-buffer window — move to main recordings dir.
             # Pre-buffer uses the same YYYY-MM-DD/HHMMSS.mp4 layout so the
             # indexer's parse_segment_filename() works without any changes.

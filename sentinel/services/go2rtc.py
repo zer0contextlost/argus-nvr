@@ -288,27 +288,23 @@ def go2rtc_status() -> dict:
 
 def reload_go2rtc() -> None:
     """
-    Write an updated config and sync stream changes to the running go2rtc
-    instance via its REST API. Falls back to a full process restart only if
-    the API is unreachable (e.g. go2rtc crashed or hasn't started yet).
+    Write an updated config and restart go2rtc so it picks up camera changes.
+
+    Previously this tried a "lightweight API-based sync" that was actually
+    just a GET /api/streams health check -- it never pushed the rewritten
+    config into go2rtc's runtime, so added/edited cameras silently never
+    appeared in go2rtc (streams stayed whatever was loaded at process start)
+    until something else happened to restart the whole app. A real per-stream
+    sync via go2rtc's PUT /api/streams could avoid the restart, but a full
+    restart is simple, correct, and already how every other config change
+    (e.g. detect-zone edits) gets picked up -- the player's reconnect/backoff
+    logic is designed to ride this out.
     """
     global _supervisor
     write_go2rtc_config()
     if _supervisor is None:
         log.warning("go2rtc supervisor not running — skipping reload")
         return
-    # Try a lightweight API-based sync first (no dropped WebRTC sessions).
-    # The API is available whenever go2rtc is up; if it fails, fall back to restart.
-    base = go2rtc_api_base()
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            resp = client.get(f"{base}/api/streams")
-        if resp.status_code == 200:
-            log.info("go2rtc config updated; stream state synced via API (no restart)")
-            return
-    except Exception as exc:
-        log.debug("go2rtc API not reachable (%s); falling back to process restart", exc)
-
     log.info("reloading go2rtc after camera change (full restart)")
     _supervisor.restart()
 

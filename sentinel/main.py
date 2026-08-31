@@ -220,7 +220,7 @@ from sentinel.api.system import router as system_router
 from sentinel.api.cameras import router as cameras_router
 from sentinel.api.live import router as live_router
 from sentinel.api.recordings import router as recordings_router
-from sentinel.api.events import router as events_router
+from sentinel.api.events import router as events_router, ws_router as events_ws_router
 from sentinel.api.timeline import router as timeline_router
 from sentinel.api.settings import router as settings_router
 from sentinel.api.proxy import router as proxy_router
@@ -255,6 +255,12 @@ app.include_router(live_router, prefix="/api", dependencies=_auth_dep)
 app.include_router(timeline_router, prefix="/api", dependencies=_auth_dep_flex)
 app.include_router(recordings_router, prefix="/api", dependencies=_auth_dep)
 app.include_router(events_router, prefix="/api", dependencies=_auth_dep_flex)
+# events_ws_router carries only /events/ws. Mounted WITHOUT the auth
+# dependency above: HTTPBearer (behind get_current_user_flexible) requires an
+# HTTP Request, which doesn't exist when FastAPI solves dependencies for a
+# WebSocket route, so applying it here would crash every connection attempt.
+# The route authenticates itself via a ?token= query param instead.
+app.include_router(events_ws_router, prefix="/api")
 app.include_router(settings_router, prefix="/api", dependencies=_auth_dep)
 app.include_router(persons_router, prefix="/api")
 app.include_router(users_router, prefix="/api", dependencies=_auth_dep)
