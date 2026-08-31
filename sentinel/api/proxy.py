@@ -156,7 +156,22 @@ async def proxy_ws(websocket: WebSocket):
                 except Exception as exc:
                     log.debug("go2rtc→client error: %s", exc)
 
-            await asyncio.gather(client_to_go2rtc(), go2rtc_to_client())
+            # Race the two pumps instead of gather()ing them. gather() waits
+            # for BOTH to finish, but when the browser tab closes only
+            # client_to_go2rtc() ends (iter_text() raises); go2rtc_to_client()
+            # stays parked in go2rtc_ws.recv() forever since go2rtc has no
+            # reason to close its end first. That kept `async with ws_connect`
+            # (and its socket to go2rtc) open indefinitely — one leaked fd per
+            # browser viewing session — until the process hit its open-files
+            # ulimit and backups/recording-indexing started failing.
+            pump_tasks = [asyncio.ensure_future(client_to_go2rtc()), asyncio.ensure_future(go2rtc_to_client())]
+            _, pending = await asyncio.wait(pump_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
     except Exception as exc:
         log.warning("WS proxy error: %s", exc)
     finally:
