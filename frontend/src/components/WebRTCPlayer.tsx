@@ -36,6 +36,9 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
   const wsRef = useRef<WebSocket | null>(null)
   const [mode, setMode] = useState<'webrtc' | 'offline'>('webrtc')
   const [reconnecting, setReconnecting] = useState(false)
+  // False until the first track arrives for the current stream, so the initial
+  // connect shows a spinner instead of a bare black box.
+  const [connected, setConnected] = useState(false)
   const [useSubStream, setUseSubStream] = useState(false)
   const [showHeatmap, setShowHeatmap] = useState(false)
   const [showPtz, setShowPtz] = useState(false)
@@ -160,6 +163,7 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
         v.play().catch(() => { /* autoplay policy; watchdog will catch stall */ })
         setMode('webrtc')
         setReconnecting(false)
+        setConnected(true)
         onConnChangeRef.current?.(true)
         if (iceTimerRef.current) { clearTimeout(iceTimerRef.current); iceTimerRef.current = null }
         startWatchdog()
@@ -256,6 +260,7 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
     destroyedRef.current = false
     retryCountRef.current = 0
     genRef.current += 1
+    setConnected(false)
     startWebRTC()
     return () => {
       destroyedRef.current = true
@@ -351,8 +356,8 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
         style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
       />
 
-      {/* Reconnecting overlay — shown while WebRTC is renegotiating */}
-      {reconnecting && (
+      {/* Connecting/reconnecting overlay — shown until video is flowing */}
+      {(reconnecting || !connected) && (
         <div style={{
           position: 'absolute', inset: 0,
           background: 'rgba(0,0,0,0.55)',
@@ -368,7 +373,7 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
             <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/>
           </svg>
           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', fontWeight: 600, letterSpacing: '0.06em' }}>
-            RECONNECTING
+            {reconnecting ? 'RECONNECTING' : 'CONNECTING'}
           </span>
         </div>
       )}

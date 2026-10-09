@@ -3,8 +3,14 @@
  * without re-keying the <video> element by swapping src imperatively.
  *
  * Exposes seek / play / pause / setSpeed via forwardRef handle.
- * Uses a hidden preload video to buffer the next segment 15s before the
- * current one ends, then swaps into the primary element on handleEnded.
+ * Two stacked <video> elements alternate roles: the visible "primary" plays
+ * the current segment while the hidden "standby" buffers the next one (from
+ * 15s before the end). On `ended`, if the standby has its first frame decoded,
+ * the roles swap and it starts playing immediately; otherwise we fall back to
+ * loading the next segment into the primary element.
+ *
+ * Event handlers are attached to both elements but ignore any event whose
+ * target is not the current primary.
  *
  * Error-handling philosophy
  * -------------------------
@@ -25,7 +31,9 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
+  type SyntheticEvent,
   useState,
 } from 'react'
 import { TimelineSegment, withToken } from '../api/client'
@@ -70,6 +78,10 @@ interface InternalState {
    * spurious reloads.  `null` means "no source currently expected".
    */
   expectedSrc: string | null
+  /** Which of the two video elements is currently the visible primary. */
+  active: 0 | 1
+  /** Segment index the standby element is buffering, or null. */
+  standbySegIdx: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -81,15 +93,33 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
     { segments, onWallTimeChange, onPlayingChange, onGapSkipped, onError },
     ref,
   ) {
-    const primaryRef = useRef<HTMLVideoElement>(null)
-    const preloadRef = useRef<HTMLVideoElement>(null)
+    const videoARef = useRef<HTMLVideoElement>(null)
+    const videoBRef = useRef<HTMLVideoElement>(null)
     const stateRef = useRef<InternalState>({
       segIdx: null,
       pendingOffset: null,
       speed: 1,
       playing: false,
       expectedSrc: null,
+      active: 0,
+      standbySegIdx: null,
     })
+
+    const getPrimary = () =>
+      (stateRef.current.active === 0 ? videoARef : videoBRef).current
+    const getStandby = () =>
+      (stateRef.current.active === 0 ? videoBRef : videoARef).current
+    /** Wrap a media event handler so it only runs for the current primary. */
+    const forPrimary = (fn: () => void) =>
+      (e: SyntheticEvent<HTMLVideoElement>) => {
+        if (e.currentTarget === getPrimary()) fn()
+      }
+
+    // Initial visibility is set imperatively (not via the style prop) because
+    // swapStandbyIn() flips it imperatively and React must not fight it.
+    useLayoutEffect(() => {
+      if (videoBRef.current) videoBRef.current.style.visibility = 'hidden'
+    }, [])
 
     // Keep latest segments in a ref so imperative handlers don't close over
     // a stale snapshot.
@@ -155,13 +185,55 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
       }
     }
 
+    /** Drop whatever the standby element is buffering. */
+    function resetStandby(): void {
+      stateRef.current.standbySegIdx = null
+      const standby = getStandby()
+      if (standby && standby.getAttribute('src') !== null) clearPrimary(standby)
+    }
+
+    /**
+     * Promote the standby element (already buffering segment `nextIdx`) to
+     * primary and start it playing from `startAt` seconds. Returns false if it isn't ready, in which
+     * case the caller should load the segment the slow way.
+     */
+    function swapStandbyIn(nextIdx: number, startAt: number): boolean {
+      const oldPrimary = getPrimary()
+      const standby = getStandby()
+      if (!oldPrimary || !standby) return false
+      if (stateRef.current.standbySegIdx !== nextIdx) return false
+      if (standby.readyState < 2 /* HAVE_CURRENT_DATA */) return false
+
+      stateRef.current.active = stateRef.current.active === 0 ? 1 : 0
+      stateRef.current.standbySegIdx = null
+      stateRef.current.segIdx = nextIdx
+      stateRef.current.pendingOffset = null
+      stateRef.current.expectedSrc = standby.getAttribute('src')
+
+      if (startAt > 0) {
+        try { standby.currentTime = startAt } catch { /* no-op */ }
+      }
+      standby.playbackRate = stateRef.current.speed
+      standby.muted = false
+      standby.style.visibility = 'visible'
+      oldPrimary.style.visibility = 'hidden'
+      oldPrimary.muted = true
+      try { oldPrimary.pause() } catch { /* no-op */ }
+
+      if (stateRef.current.playing) {
+        const result = standby.play()
+        if (result && typeof result.catch === 'function') result.catch(() => {})
+      }
+      return true
+    }
+
     // ------------------------------------------------------------------
     // Imperative handle
     // ------------------------------------------------------------------
 
     useImperativeHandle(ref, () => ({
       seek(wallMs: number) {
-        const primary = primaryRef.current
+        const primary = getPrimary()
         if (!primary) return
 
         const segs = segmentsRef.current
@@ -183,6 +255,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
             stateRef.current.pendingOffset = offset
           }
         } else {
+          resetStandby()
           stateRef.current.segIdx = segIdx
           stateRef.current.pendingOffset = offset
           stateRef.current.expectedSrc = loadSegIntoElement(primary, seg.id)
@@ -191,7 +264,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
       },
 
       play() {
-        const primary = primaryRef.current
+        const primary = getPrimary()
         if (!primary) return
         stateRef.current.playing = true
 
@@ -223,7 +296,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
 
       pause() {
         stateRef.current.playing = false
-        const primary = primaryRef.current
+        const primary = getPrimary()
         if (primary) {
           try {
             primary.pause()
@@ -235,8 +308,8 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
 
       setSpeed(s: number) {
         stateRef.current.speed = s
-        if (primaryRef.current) {
-          primaryRef.current.playbackRate = s
+        for (const el of [videoARef.current, videoBRef.current]) {
+          if (el) el.playbackRate = s
         }
       },
     }))
@@ -246,7 +319,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
     // ------------------------------------------------------------------
 
     function handleLoadedMetadata() {
-      const primary = primaryRef.current
+      const primary = getPrimary()
       if (!primary) return
 
       primary.playbackRate = stateRef.current.speed
@@ -269,8 +342,8 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
     }
 
     function handleTimeUpdate() {
-      const primary = primaryRef.current
-      const preload = preloadRef.current
+      const primary = getPrimary()
+      const standby = getStandby()
       const segs = segmentsRef.current
       if (!primary || stateRef.current.segIdx === null) return
 
@@ -283,23 +356,19 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
 
       // Preload next segment when within 15s of the end.
       const remaining = primary.duration - primary.currentTime
-      if (remaining < 15 && !isNaN(remaining) && preload) {
+      if (remaining < 15 && !isNaN(remaining) && standby) {
         const nextIdx = stateRef.current.segIdx + 1
-        if (nextIdx < segs.length) {
-          const nextSeg = segs[nextIdx]
-          const expectedSrc = withToken(`/api/recordings/${nextSeg.id}/video`)
-          // Compare against the raw assigned src (browser may normalize
-          // currentSrc to an absolute URL, but src returns what we set).
-          if (preload.getAttribute('src') !== expectedSrc) {
-            preload.src = expectedSrc
-            preload.load()
-          }
+        if (nextIdx < segs.length && stateRef.current.standbySegIdx !== nextIdx) {
+          standby.muted = true
+          standby.playbackRate = stateRef.current.speed
+          loadSegIntoElement(standby, segs[nextIdx].id)
+          stateRef.current.standbySegIdx = nextIdx
         }
       }
     }
 
     function handleEnded() {
-      const primary = primaryRef.current
+      const primary = getPrimary()
       const segs = segmentsRef.current
       if (stateRef.current.segIdx === null || !primary) return
 
@@ -323,13 +392,22 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
         onGapSkipped?.(prevEndMs, nextStartMs)
       }
 
+      // Pre-roll harvested at a motion trigger overlaps the first seconds of
+      // the main recording; start the next segment past the overlap instead
+      // of replaying it. Sub-0.5s overlaps are naming jitter, not real.
+      const overlapS = gapMs < -500 ? Math.min(-gapMs / 1000, 10) : 0
+
+      if (swapStandbyIn(nextIdx, overlapS)) return
+
+      // Standby not ready (or buffering something else) — load the slow way.
+      resetStandby()
       stateRef.current.segIdx = nextIdx
-      stateRef.current.pendingOffset = 0
+      stateRef.current.pendingOffset = overlapS
       stateRef.current.expectedSrc = loadSegIntoElement(primary, nextSeg.id)
     }
 
     function handleError() {
-      const primary = primaryRef.current
+      const primary = getPrimary()
       if (!primary) return
 
       // No source expected at all — spurious error from mount / src detach.
@@ -361,7 +439,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
     function handlePause() {
       // Distinguish a real pause from an end-of-stream pause (handleEnded
       // already reports !playing).  If we're at the end, let handleEnded own it.
-      const primary = primaryRef.current
+      const primary = getPrimary()
       if (primary && primary.ended) return
       stateRef.current.playing = false
       onPlayingChange(false)
@@ -373,7 +451,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
 
     useEffect(() => {
       if (segments.length === 0) {
-        const primary = primaryRef.current
+        const primary = getPrimary()
         // Order matters: clear expectedSrc FIRST so handleError treats any
         // resulting error event as spurious.
         stateRef.current.expectedSrc = null
@@ -381,6 +459,7 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
         stateRef.current.pendingOffset = null
         stateRef.current.playing = false
         if (primary) clearPrimary(primary)
+        resetStandby()
         setHasSource(false)
       }
     }, [segments])
@@ -391,34 +470,30 @@ export const ContinuousVideoPlayer = forwardRef<ContinuousVideoPlayerHandle, Pro
 
     return (
       <div style={{ position: 'relative', width: '100%', background: '#000' }}>
-        <video
-          ref={primaryRef}
-          controls={false}
-          preload="auto"
-          playsInline
-          onLoadedMetadata={handleLoadedMetadata}
-          onTimeUpdate={handleTimeUpdate}
-          onEnded={handleEnded}
-          onError={handleError}
-          onPlay={handlePlay}
-          onPause={handlePause}
-          style={{
-            display: 'block',
-            width: '100%',
-            aspectRatio: '16 / 9',
-            background: '#000',
-          }}
-        />
-
-        {/* Hidden preload buffer */}
-        <video
-          ref={preloadRef}
-          preload="auto"
-          muted
-          playsInline
-          style={{ display: 'none' }}
-          aria-hidden="true"
-        />
+        {/* Two stacked elements; roles alternate (see header comment). A sits
+            in normal flow and sizes the box, B overlays it exactly. */}
+        {[videoARef, videoBRef].map((r, i) => (
+          <video
+            key={i}
+            ref={r}
+            controls={false}
+            preload="auto"
+            playsInline
+            onLoadedMetadata={forPrimary(handleLoadedMetadata)}
+            onTimeUpdate={forPrimary(handleTimeUpdate)}
+            onEnded={forPrimary(handleEnded)}
+            onError={forPrimary(handleError)}
+            onPlay={forPrimary(handlePlay)}
+            onPause={forPrimary(handlePause)}
+            style={{
+              display: 'block',
+              width: '100%',
+              aspectRatio: '16 / 9',
+              background: '#000',
+              ...(i === 1 ? { position: 'absolute', top: 0, left: 0 } : {}),
+            }}
+          />
+        ))}
 
         {/* Placeholder overlay — shown when no segment is loaded */}
         {!hasSource && (

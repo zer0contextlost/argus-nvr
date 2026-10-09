@@ -84,6 +84,35 @@ RECORDER_LINGER_S: float = 90.0
 # through a long motion-free stretch.
 PREBUFFER_HOUSEKEEPING_INTERVAL_S: float = 30.0
 
+# How long (seconds) the pre-buffer keeps running alongside the main recorder
+# after a motion trigger before it is stopped and harvested. Stopping it first
+# (the old order) left a ~1s hole at the start of every event while the main
+# FFmpeg connected and waited for a keyframe. Must exceed the 5s pre-buffer
+# chunk length so the chunk holding the trigger moment has closed. Both
+# consumers read the local go2rtc restream, so the overlap costs no extra
+# camera connection.
+PREBUFFER_HANDOFF_S: float = 6.0
+
+# Bitstream filter that collapses video timestamp jumps, used by
+# _repair_timestamp_jumps(). Some cameras' RTP clocks leap forward several
+# seconds on a stream hiccup; with -c:v copy the leap is written into the MP4
+# as a hole that playback freezes on and then skips past. Any packet-to-packet
+# step over 1s, or a non-positive one, is replaced with one ~15fps frame step;
+# every other step is kept exactly as the camera stamped it.
+#
+# Applied as a one-off remux of an already-closed segment, NOT on the live
+# recorder: with FFmpeg 5.1's segment muxer, setts' PREV_OUTPTS doesn't track
+# and every packet comes out 1 tick after the last (tested 2026-10-08). Also
+# not -use_wallclock_as_timestamps: tested the same day, it turned brief
+# delivery stalls (host load, a vzdump suspend) into freeze-then-burst
+# playback and doubled frame-timing jitter, where the camera's own timestamps
+# were correct. Commas are escaped because -bsf uses them to chain filters.
+COLLAPSE_TS_JUMPS_BSF: str = (
+    r"setts=ts=if(eq(PREV_OUTPTS\,NOPTS)\,PTS\,"
+    r"PREV_OUTPTS+if(gt(PTS-PREV_INPTS\,1/TB)+lte(PTS-PREV_INPTS\,0)\,"
+    r"0.0667/TB\,PTS-PREV_INPTS))"
+)
+
 # ---------------------------------------------------------------------------
 # Module-level registry: camera_id -> CameraRecorder
 # ---------------------------------------------------------------------------
@@ -130,6 +159,38 @@ def _probe_segment(path: Path) -> dict:
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError, ValueError) as exc:
         log.warning("ffprobe error on %s: %s", path, exc)
         return {}
+
+
+def _repair_timestamp_jumps(path: Path) -> bool:
+    """
+    Remux a closed segment in place with COLLAPSE_TS_JUMPS_BSF. Stream copy, so
+    it takes well under a second for a 2-minute segment. Returns True if the
+    file was replaced.
+    """
+    # Must not end in .mp4, or the indexer's *.mp4 scan would pick it up.
+    tmp = path.with_name(f".{path.stem}.tsfix")
+    cmd = [
+        str(settings.ffmpeg_path),
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(path),
+        "-map", "0", "-c", "copy",
+        "-bsf:v", COLLAPSE_TS_JUMPS_BSF,
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+default_base_moof",
+        str(tmp),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 4096:
+            log.warning("timestamp repair failed on %s: %s", path, result.stderr[:200])
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, path)
+        return True
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.warning("timestamp repair error on %s: %s", path, exc)
+        tmp.unlink(missing_ok=True)
+        return False
 
 
 def parse_segment_filename(path: Path) -> Optional[datetime]:
@@ -572,22 +633,32 @@ class SegmentIndexer:
         started_at_dt = parse_segment_filename(path)
         started_at = _iso(started_at_dt)
 
-        # Clamp the probed duration to the file's wall-clock write window.
         # Camera 5 (and occasionally the Wyze) emits broken video timestamps
-        # that jump forward mid-segment; ffprobe then reports hours of
-        # "duration" for a seconds-long file. A segment can never be longer
-        # than (last write) - (segment open), so use that as the ceiling.
+        # that jump forward mid-segment; ffprobe then reports far more
+        # "duration" than the file's wall-clock write window, and playback
+        # freezes then skips at the jump. Repair the file itself, then clamp
+        # the duration to the window as a ceiling in case the repair didn't
+        # fully fix it. A segment can never be longer than
+        # (last write) - (segment open).
         if duration_s and started_at_dt:
             try:
                 mtime_dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
                 wall_s = (mtime_dt - started_at_dt).total_seconds() + 2.0
                 if wall_s > 0 and duration_s > wall_s:
+                    probed_s = duration_s
+                    if _repair_timestamp_jumps(path):
+                        duration_s = _probe_segment(path).get("duration_s") or duration_s
+                        try:
+                            size_bytes = path.stat().st_size
+                        except OSError:
+                            pass
                     log.warning(
                         "[indexer cam=%s] %s: probed duration %.1fs exceeds wall-clock "
-                        "window %.1fs — clamping (broken camera timestamps)",
-                        self.camera_id, path.name, duration_s, wall_s,
+                        "window %.1fs (broken camera timestamps) — repaired to %.1fs%s",
+                        self.camera_id, path.name, probed_s, wall_s, duration_s,
+                        ", clamping" if duration_s > wall_s else "",
                     )
-                    duration_s = wall_s
+                    duration_s = min(duration_s, wall_s)
             except OSError:
                 pass
 
@@ -756,6 +827,11 @@ class CameraRecorder:
         self._linger_timer: Optional[threading.Timer] = None
         self._lifecycle_lock = threading.Lock()
 
+        # Pending pre-buffer handoff (see PREBUFFER_HANDOFF_S) and the time of
+        # the trigger it belongs to.
+        self._handoff_timer: Optional[threading.Timer] = None
+        self._handoff_trigger_at: float = 0.0
+
         # Periodic pre-buffer housekeeping timer: age-prunes .prebuffer segments
         # while the pre-buffer runs unattended (no motion). _collect_prebuffer()
         # is otherwise only invoked from open_gate(), so a camera with no motion
@@ -793,6 +869,9 @@ class CameraRecorder:
             if self._linger_timer is not None:
                 self._linger_timer.cancel()
                 self._linger_timer = None
+            if self._handoff_timer is not None:
+                self._handoff_timer.cancel()
+                self._handoff_timer = None
             if self._supervisor:
                 self._supervisor.stop()
                 self._supervisor = None
@@ -807,24 +886,43 @@ class CameraRecorder:
         """Open the motion gate (start recording).  Phase 4 integration point."""
         self._gate.open()
         with self._lifecycle_lock:
-            # Stop the pre-buffer recorder before starting the main one — we
-            # only want one RTSP consumer per camera at a time.
-            self._stop_prebuffer()
-            # Harvest AFTER stopping the pre-buffer so its final segment — the
-            # one holding the seconds immediately before the trigger — is closed
-            # on disk and gets collected too. Previously harvest ran while the
-            # pre-buffer was still writing, so the open chunk was skipped
-            # (segments[:-1]) and then deleted on the next event, guaranteeing
-            # the loss of the moment of the trigger. Fragmented MP4 stays
-            # playable even if FFmpeg was cut mid-segment.
-            self._collect_prebuffer(include_last=True)
             # A pending linger-stop means FFmpeg is still alive from the previous
             # motion window — cancel the stop and reuse the existing consumer.
             if self._linger_timer is not None:
                 self._linger_timer.cancel()
                 self._linger_timer = None
-            if self._supervisor is None:
-                self._start_supervisor()
+            if self._supervisor is not None:
+                return
+            # Start the main recorder FIRST and leave the pre-buffer running
+            # until the main one is producing footage; the handoff stops and
+            # harvests the pre-buffer PREBUFFER_HANDOFF_S later.
+            self._start_supervisor()
+            if self._prebuffer_supervisor is not None and self._handoff_timer is None:
+                self._handoff_trigger_at = time.time()
+                self._handoff_timer = threading.Timer(
+                    PREBUFFER_HANDOFF_S, self._prebuffer_handoff
+                )
+                self._handoff_timer.daemon = True
+                self._handoff_timer.start()
+
+    def _prebuffer_handoff(self) -> None:
+        """Fired PREBUFFER_HANDOFF_S after a trigger: stop and harvest the pre-buffer."""
+        with self._lifecycle_lock:
+            self._handoff_timer = None
+            if self._prebuffer_supervisor is None:
+                return  # recorder stopped meanwhile
+            self._stop_prebuffer()
+            # Harvest AFTER stopping the pre-buffer so its final segment is
+            # closed on disk and gets collected too. Fragmented MP4 stays
+            # playable even if FFmpeg was cut mid-segment.
+            self._collect_prebuffer(
+                include_last=True, trigger_at=self._handoff_trigger_at
+            )
+            # Gate already closed and the main recorder already lingered out
+            # (only possible if the linger is shorter than the handoff): the
+            # pre-buffer must come back for the next event.
+            if self._supervisor is None and self.record_mode == "motion-only":
+                self._start_prebuffer()
 
     def close_gate(self) -> None:
         """Close the motion gate (pause recording for motion-only cameras)."""
@@ -954,6 +1052,11 @@ class CameraRecorder:
         with self._lifecycle_lock:
             if self._prebuffer_supervisor is None:
                 return  # gate opened / recorder stopped since this fired
+            if self._handoff_timer is not None:
+                # A trigger's handoff is pending; pruning relative to now could
+                # delete pre-roll it is about to harvest. Check again next tick.
+                self._schedule_prebuffer_housekeeping()
+                return
             try:
                 self._collect_prebuffer(include_last=False, harvest=False)
             except Exception as exc:
@@ -972,7 +1075,12 @@ class CameraRecorder:
             sup.stop()
             log.debug("[recorder cam=%s] pre-buffer recorder stopped", self.camera_id)
 
-    def _collect_prebuffer(self, include_last: bool = False, harvest: bool = True) -> None:
+    def _collect_prebuffer(
+        self,
+        include_last: bool = False,
+        harvest: bool = True,
+        trigger_at: Optional[float] = None,
+    ) -> None:
         """
         Age-prune the pre-buffer directory, deleting segments older than the
         pre-buffer window.
@@ -992,11 +1100,16 @@ class CameraRecorder:
         promoting them into the permanent recording without any actual
         motion would silently turn motion-only mode into continuous
         recording.
+
+        trigger_at: epoch time of the motion trigger when harvesting after a
+        delayed handoff. The pre-roll window is measured back from the trigger
+        rather than from now, and chunks that started after the trigger are
+        dropped since the main recorder already covers that time.
         """
         if not self._prebuffer_dir.exists():
             return
         now = time.time()
-        threshold = now - settings.motion_pre_buffer_seconds
+        threshold = (trigger_at or now) - settings.motion_pre_buffer_seconds
 
         segments = sorted(self._prebuffer_dir.rglob("*.mp4"))
         # Skip the last file only when the pre-buffer FFmpeg may still hold it open.
@@ -1027,12 +1140,26 @@ class CameraRecorder:
                 continue
             if not harvest:
                 continue  # within window, no motion — leave it in the pre-buffer
+            if trigger_at is not None:
+                try:
+                    seg_start = datetime.strptime(
+                        f"{seg.parent.name} {seg.stem}", "%Y-%m-%d %H%M%S"
+                    ).timestamp()  # local time, same as FFmpeg's strftime naming
+                except ValueError:
+                    seg_start = None
+                if seg_start is not None and seg_start > trigger_at:
+                    seg.unlink(missing_ok=True)
+                    continue
             # Within the pre-buffer window — move to main recordings dir.
             # Pre-buffer uses the same YYYY-MM-DD/HHMMSS.mp4 layout so the
             # indexer's parse_segment_filename() works without any changes.
             dest_dir = self._cam_dir / seg.parent.name
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / seg.name
+            if dest.exists():
+                # Same-second name as a main-recorder segment; never clobber it.
+                seg.unlink(missing_ok=True)
+                continue
             try:
                 seg.rename(dest)
                 moved += 1

@@ -350,8 +350,14 @@ export function LivePage() {
       })
 
   // Filter out cameras explicitly marked offline (never hides 'unknown').
+  // Always keep the currently-fullscreened camera in the list even if it
+  // transiently flags offline (brief ICE hiccup, watchdog stall-restart) --
+  // otherwise it silently drops out of `visible` below, the promoted
+  // fullscreen tile (see the grid map further down) unmounts, and the user
+  // is dumped back to the grid mid-view with no indication why.
   const displayStreams = hideOffline
-    ? orderedStreams.filter(s => connStates.get(s.camera_id) !== 'offline')
+    ? orderedStreams.filter(s =>
+        connStates.get(s.camera_id) !== 'offline' || s.camera_id === expandedStream?.camera_id)
     : orderedStreams
 
   const offlineCount = orderedStreams.filter(s => connStates.get(s.camera_id) === 'offline').length
@@ -652,6 +658,8 @@ export function LivePage() {
             // own player). The player element stays mounted at its stable tree
             // position, so the live WebRTC connection survives the transition and
             // there is no 3-5s black reconnect gap entering or leaving fullscreen.
+            // This only holds while both branches below keep the identical
+            // div > div > ZoomableWrapper > player element nesting.
             const isPromoted = isExpanded && !cycleActive
             const player = (
               <WebRTCPlayer
@@ -711,24 +719,30 @@ export function LivePage() {
                   position: 'relative',
                 }}
               >
-                <ZoomableWrapper
-                  active={isSingle}
-                  onDoubleClickWhenReset={() => setExpandedStream(s)}
-                >
-                  {/* Suspend the grid tile's player only while kiosk cycling has
-                      this camera in the overlay (its own switching player owns the
-                      connection then). */}
-                  {isExpanded ? (
-                    <div style={{
-                      height: '100%', background: '#000',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    }}>
-                      <span style={{ color: 'rgba(255,255,255,0.25)', fontSize: 12 }}>
-                        {s.camera_name}
-                      </span>
-                    </div>
-                  ) : player}
-                </ZoomableWrapper>
+                {/* Same div > ZoomableWrapper > player nesting as the promoted
+                    branch above. If the element types along this path differ
+                    between the two branches, React unmounts the player on every
+                    fullscreen enter/exit and the WebRTC session drops to black. */}
+                <div style={{ height: '100%' }}>
+                  <ZoomableWrapper
+                    active={isSingle}
+                    onDoubleClickWhenReset={() => setExpandedStream(s)}
+                  >
+                    {/* Suspend the grid tile's player only while kiosk cycling has
+                        this camera in the overlay (its own switching player owns the
+                        connection then). */}
+                    {isExpanded ? (
+                      <div style={{
+                        height: '100%', background: '#000',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        <span style={{ color: 'rgba(255,255,255,0.25)', fontSize: 12 }}>
+                          {s.camera_name}
+                        </span>
+                      </div>
+                    ) : player}
+                  </ZoomableWrapper>
+                </div>
               </div>
             )
           })}
