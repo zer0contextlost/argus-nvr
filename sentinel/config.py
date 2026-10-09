@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     # --- Storage retention ---------------------------------------------------
     retention_max_age_days: int = 30
     retention_free_space_floor_pct: int = 10
+    # Hard cap on total recording size (SUM of recordings.size_bytes), oldest
+    # deleted first regardless of event links. 0 = no cap. Set in .env as
+    # RETENTION_MAX_TOTAL_GB.
+    retention_max_total_gb: float = 0
     retention_event_min_age_days: int = 90  # event-linked recordings kept at least this long
 
     # --- Backup --------------------------------------------------------------

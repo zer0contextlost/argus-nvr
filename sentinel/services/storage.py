@@ -453,6 +453,83 @@ def _prune_for_space(db: sqlite3.Connection, _disk_usage_fn=None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Total-size cap enforcement
+# ---------------------------------------------------------------------------
+
+def _prune_for_size(db: sqlite3.Connection) -> int:
+    """
+    While the recordings' total size (SUM(size_bytes), the same figure the
+    dashboard shows) exceeds RETENTION_MAX_TOTAL_GB, delete the oldest
+    segment and repeat. A hard cap: unlike age pruning it does not spare
+    event-linked recordings. Each camera's newest (possibly still-open)
+    segment is never touched. No-op when the cap is 0.
+
+    Returns the number of rows deleted.
+    """
+    cap_gb = settings.retention_max_total_gb
+    if not cap_gb or cap_gb <= 0:
+        return 0
+    cap_bytes = int(cap_gb * 1e9)
+
+    total = db.execute(
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM recordings"
+    ).fetchone()[0]
+    if total <= cap_bytes:
+        return 0
+
+    log.warning(
+        "storage: recordings total %.1f GB exceeds cap %.1f GB — deleting oldest",
+        total / 1e9, cap_gb,
+    )
+
+    deleted = 0
+    failed_ids: set[int] = set()
+    while total > cap_bytes:
+        safe = _safe_ids(_all_camera_ids(db), db)
+        skip_ids = safe | failed_ids
+        if skip_ids:
+            in_clause = "WHERE id NOT IN ({})".format(",".join("?" * len(skip_ids)))
+            q_params = list(skip_ids)
+        else:
+            in_clause = ""
+            q_params = []
+
+        # Batch of oldest rows; recompute the safe set between batches only.
+        rows = db.execute(
+            f"""
+            SELECT id, path, size_bytes
+            FROM recordings
+            {in_clause}
+            ORDER BY COALESCE(ended_at, started_at) ASC, id ASC
+            LIMIT 200
+            """,
+            q_params,
+        ).fetchall()
+        if not rows:
+            log.warning(
+                "storage: no more deletable segments but recordings total is "
+                "still %.1f GB (cap %.1f GB)", total / 1e9, cap_gb,
+            )
+            break
+
+        for row in rows:
+            if total <= cap_bytes:
+                break
+            if _delete_recording(row["id"], row["path"], db):
+                deleted += 1
+                total -= row["size_bytes"] or 0
+            else:
+                failed_ids.add(row["id"])
+
+    if deleted:
+        log.info(
+            "storage: size-cap cleanup deleted %d segment(s), total now %.1f GB",
+            deleted, total / 1e9,
+        )
+    return deleted
+
+
+# ---------------------------------------------------------------------------
 # Disk / storage dashboard
 # ---------------------------------------------------------------------------
 
@@ -523,6 +600,7 @@ def get_storage_status() -> dict:
         else None,
         "retention_max_age_days": settings.retention_max_age_days,
         "free_space_floor_pct": settings.retention_free_space_floor_pct,
+        "max_total_gb": settings.retention_max_total_gb,
     }
 
 
@@ -644,14 +722,16 @@ def _run_maintenance_inner(_db: sqlite3.Connection) -> dict:
 
     tiny_deleted = _cleanup_tiny_orphans(_db)
     age_deleted = _prune_by_age(_db)
+    size_deleted = _prune_for_size(_db)
     space_deleted = _prune_for_space(_db)
     _check_and_alert_low_space()
 
     summary = {
         "tiny_orphans_deleted": tiny_deleted,
         "age_pruned": age_deleted,
+        "size_pruned": size_deleted,
         "space_pruned": space_deleted,
-        "total_deleted": tiny_deleted + age_deleted + space_deleted,
+        "total_deleted": tiny_deleted + age_deleted + size_deleted + space_deleted,
     }
     log.info("storage: maintenance cycle complete: %s", summary)
     return summary
