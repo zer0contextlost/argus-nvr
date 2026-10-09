@@ -264,10 +264,13 @@ async def update_detect_zone(camera_id: int, body: DetectZoneUpdate) -> dict:
 
     # Reload the detector so the new zones/thresholds take effect immediately
     # (without this, the DB had the change but the running detector kept its
-    # original config until the next service restart).
+    # original config until the next service restart). Zones are detector-only
+    # config and don't appear in go2rtc.yaml, so skip the go2rtc sync.
     try:
         from sentinel.api.cameras import _apply_camera_changes
-        _apply_camera_changes(camera_id=camera_id)
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _apply_camera_changes(camera_id=camera_id, sync_streams=False)
+        )
     except Exception as exc:
         log.warning("detector reload after detect-zone update failed cam=%s: %s", camera_id, exc)
 

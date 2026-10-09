@@ -29,6 +29,13 @@ const WATCHDOG_INTERVAL_MS = 4000
 const RETRY_BASE_MS = 1000
 const RETRY_MAX_MS = 15000
 const ICE_TIMEOUT_MS = 15000
+// After this many consecutive failed attempts, show "Camera offline" and drop
+// to a slow background retry instead of the fast reconnect loop.
+const OFFLINE_AFTER_FAILURES = 4
+const OFFLINE_RETRY_MS = 60000
+// Only forgive past failures once the stream has played this long without
+// dropping, so a camera that connects then dies immediately keeps backing off.
+const STABLE_PLAY_MS = 30000
 
 export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, cameraId, ptzCapable }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -48,6 +55,9 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
   const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastProgressRef = useRef<{ t: number; at: number }>({ t: 0, at: 0 })
+  const stableTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Set when we need to (re)start once the <video> is mounted (leaving offline mode).
+  const pendingStartRef = useRef(false)
   const retryCountRef = useRef(0)
   const destroyedRef = useRef(false)
   const genRef = useRef(0)
@@ -61,6 +71,23 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
     if (iceTimerRef.current) { clearTimeout(iceTimerRef.current); iceTimerRef.current = null }
     if (watchdogRef.current) { clearInterval(watchdogRef.current); watchdogRef.current = null }
     if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null }
+    if (stableTimerRef.current) { clearTimeout(stableTimerRef.current); stableTimerRef.current = null }
+  }
+
+  // Called whenever playback is seen progressing; resets the backoff only after
+  // the stream has stayed up for STABLE_PLAY_MS (timer is cleared on any restart).
+  function markPlaying() {
+    if (stableTimerRef.current) return
+    stableTimerRef.current = setTimeout(() => {
+      stableTimerRef.current = null
+      retryCountRef.current = 0
+    }, STABLE_PLAY_MS)
+  }
+
+  // The offline view has no <video>, so leaving it must wait for the re-render.
+  function resumeFromOffline() {
+    pendingStartRef.current = true
+    setMode('webrtc')
   }
 
   function teardownPc() {
@@ -80,9 +107,20 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
     clearTimers()
     teardownPc()
     onConnChangeRef.current?.(false)
-    setReconnecting(true)
     const delay = Math.min(RETRY_BASE_MS * 2 ** retryCountRef.current, RETRY_MAX_MS)
     retryCountRef.current += 1
+    if (retryCountRef.current >= OFFLINE_AFTER_FAILURES) {
+      console.warn(`stream offline (${reason}) for ${stream.stream_name}, retrying in ${OFFLINE_RETRY_MS}ms`)
+      setReconnecting(false)
+      setConnected(false)
+      setMode('offline')
+      retryTimerRef.current = setTimeout(() => {
+        if (destroyedRef.current) return
+        resumeFromOffline()
+      }, OFFLINE_RETRY_MS)
+      return
+    }
+    setReconnecting(true)
     console.warn(`stream restart (${reason}) for ${stream.stream_name} in ${delay}ms`)
     retryTimerRef.current = setTimeout(() => {
       if (destroyedRef.current) return
@@ -101,7 +139,7 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
       const cur = v.currentTime
       if (cur > lastProgressRef.current.t + 0.01) {
         lastProgressRef.current = { t: cur, at: now }
-        retryCountRef.current = 0
+        markPlaying()
       } else if (now - lastProgressRef.current.at > STALL_TIMEOUT_MS) {
         scheduleRestart('watchdog-stall')
       }
@@ -114,7 +152,7 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
     v.onerror = () => scheduleRestart('video-error')
     v.onended = () => scheduleRestart('video-ended')
     v.onstalled = () => { console.debug('video stalled', stream.stream_name) }
-    v.onplaying = () => { retryCountRef.current = 0; startWatchdog() }
+    v.onplaying = () => { markPlaying(); startWatchdog() }
   }
 
   async function startWebRTC() {
@@ -261,7 +299,8 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
     retryCountRef.current = 0
     genRef.current += 1
     setConnected(false)
-    startWebRTC()
+    if (mode === 'offline') resumeFromOffline()
+    else startWebRTC()
     return () => {
       destroyedRef.current = true
       genRef.current += 1
@@ -277,6 +316,14 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stream.stream_name, useSubStream])
+
+  useEffect(() => {
+    if (mode === 'webrtc' && pendingStartRef.current) {
+      pendingStartRef.current = false
+      if (!destroyedRef.current) startWebRTC()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
 
   const handleSnapshot = useCallback(async () => {
     if (!cameraId || snapping) return
@@ -335,7 +382,11 @@ export function WebRTCPlayer({ stream, style, onConnectionChange, isRecording, c
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Camera offline</div>
           <button
-            onClick={() => { retryCountRef.current = 0; setMode('webrtc'); startWebRTC() }}
+            onClick={() => {
+              if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null }
+              retryCountRef.current = 0
+              resumeFromOffline()
+            }}
             className="btn btn-secondary btn-sm"
             style={{ marginTop: 4 }}
           >

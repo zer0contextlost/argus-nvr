@@ -452,6 +452,8 @@ class _MJPEGStreamReader:
     """
 
     _MAX_BUF = 2 * 1024 * 1024
+    _RETRY_BASE_S = 3.0
+    _RETRY_MAX_S = 60.0
 
     def __init__(self, url_path: str, host: str = "127.0.0.1", port: int = 1984) -> None:
         self._host = host
@@ -471,22 +473,43 @@ class _MJPEGStreamReader:
         self._stop.set()
 
     def _run(self) -> None:
+        # Exponential backoff while the stream can't be opened (dead camera):
+        # each attempt makes go2rtc spawn an ffmpeg exec, so don't retry at a
+        # fixed few seconds forever. Reset on the first frame received.
+        failures = 0
         while not self._stop.is_set():
+            ok = False
             try:
-                self._stream()
+                ok = self._stream()
             except Exception:
-                if not self._stop.is_set():
-                    time.sleep(2)
+                pass
+            if self._stop.is_set():
+                break
+            if ok:
+                if failures:
+                    log.info("[detector %s] stream recovered after %d failed attempts",
+                             self._path, failures)
+                failures = 0
+                delay = 1.0  # was streaming; brief pause before reconnect (detection is blind meanwhile)
+            else:
+                failures += 1
+                with self._lock:
+                    self._frame = None  # don't serve a stale frame from a dead stream
+                delay = min(self._RETRY_BASE_S * 2 ** (failures - 1), self._RETRY_MAX_S)
+                if failures == 1:
+                    log.warning("[detector %s] stream unavailable, retrying with backoff (max %ds)",
+                                self._path, self._RETRY_MAX_S)
+            self._stop.wait(delay)
 
-    def _stream(self) -> None:
+    def _stream(self) -> bool:
+        """Read one connection's worth of frames. True if at least one frame arrived."""
+        got_frame = False
         conn = http.client.HTTPConnection(self._host, self._port, timeout=10)
         try:
             conn.request("GET", self._path)
             resp = conn.getresponse()
             if resp.status != 200:
-                conn.close()
-                time.sleep(2)
-                return
+                return False
             buf = b""
             while not self._stop.is_set():
                 chunk = resp.read(65536)
@@ -500,11 +523,13 @@ class _MJPEGStreamReader:
                         jpeg = buf[start:end + 2]
                         with self._lock:
                             self._frame = jpeg
+                        got_frame = True
                         buf = buf[end + 2:]
                     else:
                         break
                 if len(buf) > self._MAX_BUF:
                     buf = b""
+            return got_frame
         finally:
             try:
                 conn.close()

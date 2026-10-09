@@ -667,6 +667,7 @@ export function LivePage() {
                 style={{ height: '100%', borderRadius: isPromoted ? 'var(--radius-lg)' : undefined }}
                 isRecording={s.is_recording}
                 cameraId={s.camera_id}
+                ptzCapable={cameras.find(c => c.id === s.camera_id)?.ptz_capable}
                 onConnectionChange={connected => handleConnectionChange(s.camera_id, connected)}
               />
             )
@@ -861,6 +862,7 @@ export function LivePage() {
                   stream={expandedStream}
                   isRecording={expandedStream.is_recording}
                   cameraId={expandedStream.camera_id}
+                  ptzCapable={cameras.find(c => c.id === expandedStream.camera_id)?.ptz_capable}
                   style={{ height: '100%', borderRadius: 0 }}
                 />
               </ZoomableWrapper>

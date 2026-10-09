@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from sentinel.config import settings
-from sentinel.db import get_db
+from sentinel.db import get_db, open_db
 from sentinel.services.discovery import discover_all
 from sentinel.services.go2rtc import reload_go2rtc
 from sentinel.util.crypto import encrypt_password, decrypt_password
@@ -130,10 +130,15 @@ def _remove_detector(camera_id: int) -> None:
     remove_detector(camera_id)
 
 
-def _apply_camera_changes(camera_id: int | None = None, deleted: bool = False) -> None:
+def _apply_camera_changes(
+    camera_id: int | None = None,
+    deleted: bool = False,
+    sync_streams: bool = True,
+) -> None:
     """
     After any camera add/edit/delete:
-    1. Reload go2rtc (write new config + restart the process).
+    1. Sync go2rtc (write new config + live per-stream API sync; full restart
+       only as a fallback). Skipped when sync_streams=False.
     2. Reconcile recorders and detectors to the current enabled-camera set
        — stop orphan workers for removed/disabled cameras, start workers for
        newly added/enabled cameras.
@@ -141,12 +146,18 @@ def _apply_camera_changes(camera_id: int | None = None, deleted: bool = False) -
     Args:
         camera_id: The camera that was added/edited/deleted (None = reconcile all).
         deleted:   True when the camera was deleted (so we skip fetching it from DB).
+        sync_streams: False for changes that don't affect go2rtc's config
+                   (e.g. detect-zone edits: zones only feed the detector).
+
+    Blocking (go2rtc HTTP sync, detector restart) — async callers must run it
+    in an executor.
     """
-    # 1. Reload go2rtc so it serves the current stream set immediately.
-    try:
-        reload_go2rtc()
-    except Exception as exc:
-        log.warning("go2rtc reload failed: %s", exc)
+    # 1. Sync go2rtc so it serves the current stream set immediately.
+    if sync_streams:
+        try:
+            reload_go2rtc()
+        except Exception as exc:
+            log.warning("go2rtc reload failed: %s", exc)
 
     if camera_id is None:
         return
@@ -163,12 +174,17 @@ def _apply_camera_changes(camera_id: int | None = None, deleted: bool = False) -
             log.warning("remove_detector cam=%s failed: %s", camera_id, exc)
         return
 
-    # Camera was added or edited — fetch its current state from DB.
-    db = get_db()
-    row = db.execute(
-        "SELECT id, name, record_mode, enabled, detect_config_json, privacy_masks_json FROM cameras WHERE id=?",
-        (camera_id,),
-    ).fetchone()
+    # Camera was added or edited — fetch its current state from DB. Own
+    # connection: this runs in an executor thread, and the shared get_db()
+    # connection belongs to the event loop.
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT id, name, record_mode, enabled, detect_config_json, privacy_masks_json FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    finally:
+        conn.close()
     if row is None:
         return
 
@@ -300,7 +316,9 @@ async def add_camera(body: CameraCreate) -> dict:
     log.info("camera added id=%s name=%s host=%s", camera_id, body.name, body.host)
 
     # Reload go2rtc and reconcile recorders/detectors.
-    _apply_camera_changes(camera_id=camera_id)
+    await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _apply_camera_changes(camera_id=camera_id)
+    )
 
     row = db.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
     return _row_to_out(row)
@@ -370,7 +388,9 @@ async def update_camera(camera_id: int, body: CameraUpdate) -> dict:
         log.info("camera updated id=%s fields=%s", camera_id, list(updates.keys()))
 
         # Reload go2rtc and reconcile recorders/detectors.
-        _apply_camera_changes(camera_id=camera_id)
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _apply_camera_changes(camera_id=camera_id)
+        )
 
     row = db.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
     return _row_to_out(row)
@@ -405,7 +425,9 @@ async def delete_camera(camera_id: int):
             log.warning("delete_camera: could not remove heatmap: %s", exc)
 
     # Stop orphan recorder/detector, reload go2rtc without the deleted camera.
-    _apply_camera_changes(camera_id=camera_id, deleted=True)
+    await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _apply_camera_changes(camera_id=camera_id, deleted=True)
+    )
 
 
 # ---------------------------------------------------------------------------

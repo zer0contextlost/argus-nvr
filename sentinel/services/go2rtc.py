@@ -18,8 +18,11 @@ go2rtc YAML shape:
 
 from __future__ import annotations
 
+import logging
 import os
+import signal
 import sqlite3
+import sys
 import threading
 import urllib.parse
 from pathlib import Path
@@ -37,8 +40,18 @@ from sentinel.util.logging import get_logger
 
 log = get_logger("sentinel.go2rtc")
 
+# httpx logs every request URL at INFO. Our stream-sync PUTs carry the camera
+# RTSP URL (with credentials) in the query string, so keep that out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 _supervisor: ProcessSupervisor | None = None
 _supervisor_lock = threading.Lock()
+
+# Stream set (name -> normalized source list) that the running go2rtc is known
+# to be serving, i.e. what the last config write / runtime sync left it with.
+# None until the first write; reload_go2rtc() then seeds it from the file on disk.
+_applied_streams: dict[str, list[str]] | None = None
+_reload_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -135,15 +148,28 @@ def render_go2rtc_config(
     return config
 
 
-def write_go2rtc_config(extra_streams: dict[str, Any] | None = None) -> Path:
-    """Render and write config/go2rtc.yaml; return the path written."""
-    cfg = render_go2rtc_config(extra_streams=extra_streams)
+class _IndentedListDumper(yaml.Dumper):
+    """
+    Indent list items under their key ("  name:\n    - src") instead of PyYAML's
+    default flush style ("  name:\n  - src"). go2rtc patches this same file on
+    every PUT /api/streams, and its patcher fails with "did not find expected
+    key" (HTTP 400) when replacing an existing stream written in the flush
+    style, which forced reload_go2rtc() back to a full restart every time.
+    """
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False):
+        return super().increase_indent(flow, False)
+
+
+def _write_config_file(cfg: dict[str, Any]) -> Path:
+    """Atomically write an already-rendered config dict to go2rtc.yaml."""
     config_path = settings.go2rtc_config_path
     config_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = config_path.with_suffix(".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            yaml.dump(cfg, f, Dumper=_IndentedListDumper,
+                      default_flow_style=False, allow_unicode=True)
         os.replace(tmp, config_path)
     except Exception:
         try:
@@ -153,6 +179,17 @@ def write_go2rtc_config(extra_streams: dict[str, Any] | None = None) -> Path:
         raise
     log.info("go2rtc config written to %s (%d streams)", config_path, len(cfg["streams"]))
     return config_path
+
+
+def write_go2rtc_config(extra_streams: dict[str, Any] | None = None) -> Path:
+    """Render and write config/go2rtc.yaml; return the path written."""
+    global _applied_streams
+    cfg = render_go2rtc_config(extra_streams=extra_streams)
+    path = _write_config_file(cfg)
+    # The caller is about to (re)start go2rtc from this file, so the runtime
+    # stream set will match it.
+    _applied_streams = _normalize_streams(cfg["streams"])
+    return path
 
 
 def sync_camera_stream(
@@ -206,6 +243,44 @@ def sync_camera_stream(
 
 def _kill_stale_go2rtc() -> None:
     """Kill any go2rtc processes left over from a previous (force-killed) run."""
+    if sys.platform.startswith("win"):
+        _kill_stale_go2rtc_windows()
+    else:
+        _kill_stale_go2rtc_posix()
+
+
+def _kill_stale_go2rtc_posix() -> None:
+    """
+    Linux: scan /proc for processes whose executable is OUR configured go2rtc
+    binary (by resolved path, not just name, so an unrelated go2rtc elsewhere
+    on the box is never touched) and SIGKILL them.
+    """
+    try:
+        target = os.path.realpath(str(settings.go2rtc_path))
+        me = os.getpid()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit() or int(entry) == me:
+                continue
+            pid = int(entry)
+            try:
+                exe = os.readlink(f"/proc/{pid}/exe")
+            except OSError:
+                continue  # exited, kernel thread, or not ours to inspect
+            # A binary replaced on disk while running shows as "<path> (deleted)".
+            if exe.endswith(" (deleted)"):
+                exe = exe[: -len(" (deleted)")]
+            if os.path.realpath(exe) != target:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                log.info("killed stale go2rtc pid=%d", pid)
+            except OSError as exc:
+                log.debug("_kill_stale_go2rtc: kill pid=%d: %s", pid, exc)
+    except Exception as exc:
+        log.debug("_kill_stale_go2rtc: %s", exc)
+
+
+def _kill_stale_go2rtc_windows() -> None:
     import subprocess as _sp
     go2rtc_name = settings.go2rtc_path.name  # e.g. "go2rtc.exe"
     try:
@@ -286,27 +361,125 @@ def go2rtc_status() -> dict:
     return _supervisor.status()
 
 
+def _normalize_streams(streams: dict[str, Any] | None) -> dict[str, list[str]]:
+    """Coerce a config `streams:` mapping to {name: [source, ...]} for comparison."""
+    out: dict[str, list[str]] = {}
+    for name, srcs in (streams or {}).items():
+        if srcs is None:
+            srcs = []
+        elif isinstance(srcs, (str, bytes)):
+            srcs = [srcs]
+        out[str(name)] = [str(x) for x in srcs]
+    return out
+
+
+def diff_streams(
+    old: dict[str, list[str]], new: dict[str, list[str]]
+) -> tuple[list[str], list[str]]:
+    """
+    Return (upserts, removals): stream names that are new or whose source list
+    changed, and names present in `old` but gone from `new`. Unchanged streams
+    appear in neither list so their live sessions are never touched.
+    """
+    upserts = [n for n, srcs in new.items() if old.get(n) != srcs]
+    removals = [n for n in old if n not in new]
+    return upserts, removals
+
+
+def _read_config_streams() -> dict[str, list[str]]:
+    """Streams from the go2rtc.yaml currently on disk ({} if missing/unreadable)."""
+    try:
+        with open(settings.go2rtc_config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return _normalize_streams(data.get("streams"))
+    except Exception as exc:
+        log.debug("could not read existing go2rtc config: %s", exc)
+        return {}
+
+
+def _apply_stream_diff(upserts: dict[str, list[str]], removals: list[str]) -> None:
+    """
+    Push stream changes into the RUNNING go2rtc via its HTTP API (go2rtc 1.9.x,
+    internal/streams/api.go). Raises on any failure so the caller can fall back
+    to a full restart.
+
+      PUT    /api/streams?name=<stream>&src=<url>[&src=<url>...]
+             Creates the stream, or replaces it if the name exists (the whole
+             source list is replaced). Repeat `src` for multiple sources.
+      DELETE /api/streams?src=<stream>
+             NB: the stream NAME goes in `src` here; `name` is ignored.
+
+    Both also patch go2rtc's own config file (a no-op in effect, since we have
+    already written the same content to it).
+    """
+    base = go2rtc_api_base()
+    with httpx.Client(timeout=4.0) as client:
+        for name in removals:
+            resp = client.delete(f"{base}/api/streams", params={"src": name})
+            if resp.status_code not in (200, 204):
+                raise RuntimeError(f"DELETE {name} HTTP {resp.status_code}")
+        for name, srcs in upserts.items():
+            if not srcs:
+                # An empty source list can't be expressed via PUT (no `src`
+                # would return the stream listing); drop the stream instead.
+                resp = client.delete(f"{base}/api/streams", params={"src": name})
+            else:
+                resp = client.put(
+                    f"{base}/api/streams",
+                    params=[("name", name)] + [("src", s) for s in srcs],
+                )
+            if resp.status_code not in (200, 204):
+                raise RuntimeError(f"PUT {name} HTTP {resp.status_code}")
+
+
 def reload_go2rtc() -> None:
     """
-    Write an updated config and restart go2rtc so it picks up camera changes.
+    Write an updated config and bring the running go2rtc in line with it,
+    without restarting the process when possible.
 
-    Previously this tried a "lightweight API-based sync" that was actually
-    just a GET /api/streams health check -- it never pushed the rewritten
-    config into go2rtc's runtime, so added/edited cameras silently never
-    appeared in go2rtc (streams stayed whatever was loaded at process start)
-    until something else happened to restart the whole app. A real per-stream
-    sync via go2rtc's PUT /api/streams could avoid the restart, but a full
-    restart is simple, correct, and already how every other config change
-    (e.g. detect-zone edits) gets picked up -- the player's reconnect/backoff
-    logic is designed to ride this out.
+    go2rtc.yaml is rewritten in full (so any later restart is consistent),
+    then the old and new stream sets are diffed and ONLY added/changed/removed
+    streams (including derived <slug>_sub / <slug>_mjpeg ones) are pushed to
+    the live process through PUT/DELETE /api/streams. Editing camera A
+    therefore never disturbs viewers of camera B. If any API call fails we fall
+    back to the old behavior, a full supervisor restart.
+
+    History: an earlier "lightweight sync" here only did a GET /api/streams
+    health check and never pushed anything into go2rtc's runtime, so added or
+    edited cameras silently never appeared. The sync below really mutates the
+    runtime stream table (PUT/DELETE), so don't reduce it to a GET again.
+
+    Blocking (HTTP calls; the fallback restart waits up to ~5s). Async callers
+    must run this in an executor.
     """
-    global _supervisor
-    write_go2rtc_config()
-    if _supervisor is None:
-        log.warning("go2rtc supervisor not running — skipping reload")
-        return
-    log.info("reloading go2rtc after camera change (full restart)")
-    _supervisor.restart()
+    global _applied_streams
+    with _reload_lock:
+        cfg = render_go2rtc_config()
+        new = _normalize_streams(cfg["streams"])
+        old = _applied_streams if _applied_streams is not None else _read_config_streams()
+        _write_config_file(cfg)
+        _applied_streams = new
+
+        if _supervisor is None:
+            log.warning("go2rtc supervisor not running — skipping reload")
+            return
+
+        upserts, removals = diff_streams(old, new)
+        if not upserts and not removals:
+            log.info("go2rtc streams unchanged — nothing to sync")
+            return
+
+        try:
+            _apply_stream_diff({n: new[n] for n in upserts}, removals)
+            log.info(
+                "go2rtc streams synced live (updated=%s removed=%s)", upserts, removals
+            )
+            return
+        except Exception as exc:
+            log.warning("go2rtc live stream sync failed (%s) — falling back to full restart", exc)
+
+        log.info("reloading go2rtc after camera change (full restart)")
+        _supervisor.restart()
 
 
 def go2rtc_api_base() -> str:

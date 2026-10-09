@@ -265,7 +265,9 @@ class CooldownTracker:
             FROM notifications n
             JOIN events e ON e.id = n.event_id
             WHERE n.status = 'sent'
-              AND n.sent_at >= datetime('now', ? || ' seconds')
+              -- sent_at is stored as ISO-8601 with 'T'/'Z'; compare in the same
+              -- format (datetime('now') is space-separated and sorts wrong).
+              AND n.sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' seconds')
             """,
             (f"-{cooldown_s}",),
         ).fetchall()
