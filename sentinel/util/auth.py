@@ -89,12 +89,45 @@ def create_access_token(
     return jwt.encode(payload, _secret(), algorithm=_ALGORITHM)
 
 
-def decode_access_token(token: str) -> dict:
+class PasswordChangeRequired(jwt.InvalidTokenError):
+    """Token belongs to a user who must change their password first."""
+
+
+def decode_access_token(token: str, allow_pending_password_change: bool = False) -> dict:
     """
     Decode and verify a JWT.
     Raises jwt.ExpiredSignatureError or jwt.InvalidTokenError on failure.
+
+    Tokens issued while must_change_password=1 carry a "pwc" claim and are
+    rejected (PasswordChangeRequired) unless allow_pending_password_change is
+    set — only the /auth/me, /auth/password and /auth/logout routes allow it.
     """
-    return jwt.decode(token, _secret(), algorithms=[_ALGORITHM])
+    payload = jwt.decode(token, _secret(), algorithms=[_ALGORITHM])
+    if payload.get("pwc") and not allow_pending_password_change:
+        raise PasswordChangeRequired("Password change required")
+    return payload
+
+
+def _payload_or_http_error(token: str, allow_pending_password_change: bool = False) -> dict:
+    try:
+        return decode_access_token(token, allow_pending_password_change)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except PasswordChangeRequired:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change required",
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +143,8 @@ async def get_current_user(
     """
     FastAPI dependency.  Validates the Authorization: Bearer <token> header.
     Returns the decoded token payload on success.
-    Raises HTTP 401 on missing or invalid token.
+    Raises HTTP 401 on missing or invalid token, 403 if the user still has to
+    change their password.
     """
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
@@ -118,22 +152,20 @@ async def get_current_user(
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = credentials.credentials
-    try:
-        payload = decode_access_token(token)
-    except jwt.ExpiredSignatureError:
+    return _payload_or_http_error(credentials.credentials)
+
+
+async def get_current_user_pending_password_change(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+) -> dict:
+    """Like get_current_user, but also accepts tokens with a pending forced password change."""
+    if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired",
+            detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return payload
+    return _payload_or_http_error(credentials.credentials, allow_pending_password_change=True)
 
 
 # Convenient alias — use as `Depends(require_auth)` in route definitions.
@@ -169,21 +201,7 @@ async def get_current_user_flexible(
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    try:
-        payload = decode_access_token(token)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return payload
+    return _payload_or_http_error(token)
 
 
 # ---------------------------------------------------------------------------

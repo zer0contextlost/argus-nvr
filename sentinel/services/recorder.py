@@ -6,7 +6,7 @@ Architecture
 One CameraRecorder per enabled camera:
   - Builds the FFmpeg command to pull rtsp://127.0.0.1:8554/<stream_name>
     (go2rtc restream) and write segmented MP4 to
-    F:\\sentinel\\recordings\\<cam_slug>\\<YYYY-MM-DD>\\%H%M%S.mp4
+    <data_root>\\recordings\\<cam_slug>\\<YYYY-MM-DD>\\%H%M%S.mp4
   - Supervises the FFmpeg process via ProcessSupervisor (restart on crash).
   - A background SegmentIndexer thread watches the camera's recording directory,
     detects completed segments (new file = previous file is closed), probes them
@@ -1178,7 +1178,7 @@ class CameraRecorder:
 
         Output path uses strftime so FFmpeg names each segment with the
         wall-clock time it was started:
-          F:\\sentinel\\recordings\\<slug>\\<YYYY-MM-DD>\\<HHMMSS>.mp4
+          <data_root>\\recordings\\<slug>\\<YYYY-MM-DD>\\<HHMMSS>.mp4
 
         FFmpeg does NOT create directories for strftime output paths — every
         date directory must exist before FFmpeg opens a segment in it, or the

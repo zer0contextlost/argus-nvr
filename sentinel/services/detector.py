@@ -407,7 +407,7 @@ def _save_thumbnail(
 ) -> Optional[str]:
     """
     Decode the JPEG frame, optionally draw a bounding box, save to:
-      F:\\sentinel\\events\\<slug>\\<event_id>\\thumb.jpg
+      <data_root>\\events\\<slug>\\<event_id>\\thumb.jpg
     Returns the path as a string, or None on failure.
     box_color: RGB tuple — orange for motion, green for face.
     """
@@ -718,14 +718,19 @@ class CameraDetector:
         now_min = now_local.hour * 60 + now_local.minute
         for window in self._arm_schedule:
             days = window.get("days", list(range(7)))
-            if weekday not in days:
-                continue
             try:
                 sh, sm = map(int, window.get("start", "00:00").split(":"))
                 eh, em = map(int, window.get("end", "23:59").split(":"))
             except (ValueError, AttributeError):
                 continue
-            if sh * 60 + sm <= now_min <= eh * 60 + em:
+            start, end = sh * 60 + sm, eh * 60 + em
+            if start <= end:
+                if weekday in days and start <= now_min <= end:
+                    return True
+            # Overnight window (e.g. 22:00-06:00): the after-midnight part
+            # belongs to the day the window started on.
+            elif (weekday in days and now_min >= start) or \
+                    ((weekday - 1) % 7 in days and now_min <= end):
                 return True
         return False
 

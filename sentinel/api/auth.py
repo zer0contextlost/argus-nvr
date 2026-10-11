@@ -22,6 +22,7 @@ from sentinel.util.auth import (
     verify_password,
     create_access_token,
     get_current_user,
+    get_current_user_pending_password_change,
 )
 from sentinel.util.logging import get_logger
 
@@ -122,13 +123,15 @@ async def login(request: Request, body: LoginRequest) -> LoginResponse:
         )
 
     _clear_failures(ip)
-    token = create_access_token(
-        data={"sub": str(row["id"]), "username": row["username"], "role": row["role"]}
-    )
-    log.info("login OK username=%r role=%s ip=%s", row["username"], row["role"], ip)
     must_change = bool(db.execute(
         "SELECT must_change_password FROM users WHERE id = ?", (row["id"],)
     ).fetchone()["must_change_password"])
+    claims = {"sub": str(row["id"]), "username": row["username"], "role": row["role"]}
+    if must_change:
+        # Only the /auth/me, /auth/password and /auth/logout routes accept this token.
+        claims["pwc"] = True
+    token = create_access_token(data=claims)
+    log.info("login OK username=%r role=%s ip=%s", row["username"], row["role"], ip)
     from sentinel.util.audit import log_audit
     log_audit(
         action="auth.login",
@@ -145,7 +148,7 @@ async def login(request: Request, body: LoginRequest) -> LoginResponse:
 
 
 @router.post("/logout")
-async def logout(current_user: dict = Depends(get_current_user)) -> dict:
+async def logout(current_user: dict = Depends(get_current_user_pending_password_change)) -> dict:
     """
     Stateless logout — the client should discard the token.
     (Server-side token revocation is out of scope for v1.)
@@ -155,7 +158,7 @@ async def logout(current_user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/me")
-async def me(current_user: dict = Depends(get_current_user)) -> dict:
+async def me(current_user: dict = Depends(get_current_user_pending_password_change)) -> dict:
     """Return the currently authenticated user's info."""
     db = get_db()
     user_id = current_user.get("sub")
@@ -174,7 +177,7 @@ async def me(current_user: dict = Depends(get_current_user)) -> dict:
 @router.put("/password")
 async def change_password(
     body: ChangePasswordRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user_pending_password_change),
 ) -> dict:
     """Change the authenticated user's password."""
     db = get_db()
@@ -211,7 +214,13 @@ async def change_password(
         user_id=int(user_id),
         username=current_user.get("username", ""),
     )
-    return {"message": "Password changed successfully"}
+    # Fresh token without the "pwc" claim so the client can carry on.
+    token = create_access_token(data={
+        "sub": str(user_id),
+        "username": current_user.get("username", ""),
+        "role": current_user.get("role", ""),
+    })
+    return {"message": "Password changed successfully", "access_token": token}
 
 
 @router.post("/fcm-token")

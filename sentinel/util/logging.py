@@ -1,5 +1,5 @@
 """
-sentinel/util/logging.py -- Rotating file logging to F:\\sentinel\\logs.
+sentinel/util/logging.py -- Rotating file logging to <data_root>\\logs.
 
 Usage:
     from sentinel.util.logging import get_logger

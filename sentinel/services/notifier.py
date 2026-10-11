@@ -439,13 +439,15 @@ async def _send_webhook(event: dict, s: dict, client: httpx.AsyncClient) -> bool
         "started_at": event.get("started_at"),
     }
     headers = {"Content-Type": "application/json", "User-Agent": "Argus-NVR/1.0"}
+    import json as _json
+    # Sign and send the same bytes; httpx's json= serializes differently.
+    body_bytes = _json.dumps(payload).encode()
     if secret:
-        import hashlib, hmac, json as _json
-        body_bytes = _json.dumps(payload).encode()
+        import hashlib, hmac
         sig = hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
         headers["X-Argus-Signature"] = f"sha256={sig}"
     try:
-        r = await client.post(url, json=payload, headers=headers, timeout=8.0)
+        r = await client.post(url, content=body_bytes, headers=headers, timeout=8.0)
         log.info("[notifier] webhook → %s status=%s", url, r.status_code)
         return r.status_code < 400
     except Exception as exc:

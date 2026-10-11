@@ -19,12 +19,13 @@ import textwrap
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from sentinel.db import get_db
 from sentinel.util.crypto import decrypt_password
 from sentinel.util.logging import get_logger
+from sentinel.util.roles import require_operator_or_admin
 
 log = get_logger("sentinel.api.ptz")
 router = APIRouter(tags=["ptz"])
@@ -142,7 +143,7 @@ async def list_presets(camera_id: int) -> dict:
     return {"presets": presets}
 
 
-@router.post("/cameras/{camera_id}/ptz/move")
+@router.post("/cameras/{camera_id}/ptz/move", dependencies=[Depends(require_operator_or_admin())])
 async def relative_move(camera_id: int, body: PTZMoveRequest) -> dict:
     """Perform a relative PTZ move."""
     row = _get_ptz_camera(camera_id)
@@ -178,7 +179,7 @@ async def relative_move(camera_id: int, body: PTZMoveRequest) -> dict:
     return {"ok": True}
 
 
-@router.post("/cameras/{camera_id}/ptz/goto")
+@router.post("/cameras/{camera_id}/ptz/goto", dependencies=[Depends(require_operator_or_admin())])
 async def goto_preset(camera_id: int, body: PTZGotoRequest) -> dict:
     """Go to an ONVIF PTZ preset."""
     row = _get_ptz_camera(camera_id)
@@ -203,7 +204,7 @@ async def goto_preset(camera_id: int, body: PTZGotoRequest) -> dict:
     return {"ok": True}
 
 
-@router.post("/cameras/{camera_id}/ptz/stop")
+@router.post("/cameras/{camera_id}/ptz/stop", dependencies=[Depends(require_operator_or_admin())])
 async def stop_ptz(camera_id: int) -> dict:
     """Stop PTZ movement."""
     row = _get_ptz_camera(camera_id)

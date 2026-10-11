@@ -1,6 +1,6 @@
 # Argus NVR
 
-Self-hosted network video recorder for IP cameras. Motion-triggered recording, WebRTC live view, face recognition, multi-user RBAC, PTZ control, smart search, and a timeline scrubber — packaged as a single Windows installer or a Linux tarball.
+Self-hosted network video recorder for IP cameras. Motion-triggered recording, WebRTC live view, face recognition, multi-user RBAC, PTZ control, smart search, and a timeline scrubber — with build scripts for a Windows installer and a Linux tarball.
 
 Built on FastAPI + React + go2rtc + FFmpeg + SQLite.
 
@@ -14,67 +14,71 @@ Built on FastAPI + React + go2rtc + FFmpeg + SQLite.
 - **Motion-triggered recording** — per-camera detection zones, configurable sensitivity, pre/post-motion buffer
 - **Continuous recording** — 24/7 fragmented MP4 via FFmpeg stream-copy (near-zero CPU; crash-safe segments — no footage lost on unexpected shutdown)
 - **Timeline playback** — 24-hour scrubber with event markers, zoom levels (1h / 3h / 6h / 24h), and **hover thumbnail previews** at any point on the timeline
-- **Clip export** — download MP4 clips with optional **burned-in watermark** (camera name + timestamp)
+- **Clip export** — download MP4 clips (the export API also supports a burned-in camera name + timestamp watermark; not yet exposed in the UI)
 - **Snapshot from live view** — one-click JPEG download from any live camera tile
 - **Camera cycle / kiosk mode** — full-screen carousel through all live cameras (configurable dwell time)
 
 ### Detection & Analysis
 - **Face recognition** — InsightFace buffalo\_sc (512-d ONNX, CPU); name and track persons across cameras
 - **Heatmap overlay** — per-camera motion heatmap accumulated over time; toggle in the live view player; reset via API
-- **Smart search** — unified full-text search across events and recordings; filter by camera, event type, time range, detection score, and whether a recording exists
+- **Search** — search events by label or camera name; filter by camera, event type, time range, detection score, and whether a recording exists
 - **Hikvision support** — ISAPI alert stream for hardware VMD events (faster than frame-diff)
 - **Wyze support** — via RTSP firmware
 
 ### Camera Control
-- **PTZ control** — ONVIF pan/tilt/zoom via in-player D-pad; load and go-to presets; stop command; per-camera enable
+- **PTZ control** — ONVIF pan/tilt/zoom via in-player D-pad and stop; per-camera enable; operator or admin role required (preset list/go-to exists in the API, no UI yet)
 - **Privacy masks** — define rectangular exclusion zones per camera (stored as JSON, applied in the detection pipeline)
-- **Scheduled arming** — per-camera arm schedule (JSON time-range config); camera starts/stops detecting on schedule
+- **Scheduled arming** — per-camera arm windows (days + start/end, overnight windows supported); detection only runs inside them
 
 ### Users & Access
 - **Multi-user accounts** — admin / operator / viewer roles; admin creates and manages users via the Users page
 - **Role-based access control** — sensitive operations (purge, user management, audit log) require admin role
-- **Audit log** — every login, user create/update/delete, password reset, and camera change is logged with username, IP, and timestamp; paginated viewer with filters and purge
-- **Forced password change** — new users created with `must_change_password=1`; frontend blocks navigation until changed
+- **Audit log** — logins, password changes, and user create/update/delete/reset are logged with username, IP, and timestamp; paginated viewer with filters and purge
+- **Forced password change** — new users created with `must_change_password=1`; until it's changed, their token is only accepted by the password-change endpoint
 
 ### Notifications
-- **Push notifications** — Telegram, ntfy, SMTP email, webhook, and FCM (Android/iOS); person-aware alerts
+- **Push notifications** — Telegram, ntfy, SMTP email, and HMAC-signed webhook; person-aware alerts. FCM sending is implemented in the backend for a companion mobile app (not included), configured via the `notify_fcm_service_account_json` setting
 - **Web Push / PWA** — VAPID-based browser push notifications; subscribe from the Settings page; requires HTTPS or localhost
 
 ### Infrastructure
-- **Cloud backup** — rclone-based sync of the recordings directory to any rclone-supported remote (S3, Backblaze, Google Drive, etc.); trigger manually or on schedule; run history in Settings
-- **ONVIF output** — expose Argus cameras as ONVIF sources for third-party clients (global toggle; configurable port)
+- **Cloud backup** — rclone-based sync of the recordings directory to any rclone-supported remote (S3, Backblaze, Google Drive, etc.); triggered manually from Settings (last run status shown; full history via `GET /api/cloud-backup/history`)
 - **QR code** — Settings page shows a scannable QR code for the app URL; useful for onboarding mobile devices
 - **Per-camera retention** — storage retention limit configurable per camera (overrides global `RETENTION_MAX_AGE_DAYS`)
-- **Auto storage retention** — prunes oldest footage by age and free-space floor; disk never fills
+- **Auto storage retention** — prunes oldest footage by age, free-space floor, and an optional total-size cap (`RETENTION_MAX_TOTAL_GB`)
 - **Camera health dashboard** — per-camera recorder status, detector status, last recording time, and events-per-hour in the Health tab
-- **Windows installer** — one-click `.exe` with embedded Python 3.11, service registration (NSSM), and forced first-login password change
+- **Windows installer** — Inno Setup build with embedded Python 3.11 and service registration (NSSM)
 - **Linux installer** — bash script, systemd unit, `argus-update` upgrade script
-- **Progressive Web App** — installable on mobile, offline app shell
+- **Progressive Web App** — installable on mobile (online only; the service worker doesn't cache)
 
 ---
 
 ## Installation
 
+There are no prebuilt releases yet; build from source.
+
+### Linux (Debian 12/13, Ubuntu 22.04/24.04)
+
+```bash
+git clone https://github.com/zer0contextlost/argus-nvr.git
+cd argus-nvr
+(cd frontend && npm ci && npm run build)   # needs Node.js 20+
+sudo ./installer/linux/install.sh
+```
+
+Installs to `/opt/argus/`, creates an `argus` system user, writes `/etc/argus/.env` with a fresh secret key, and enables the `argus` systemd unit. You need FFmpeg (`apt install ffmpeg`) and a [go2rtc](https://github.com/AlexxIT/go2rtc/releases) binary at `/opt/argus/tools/go2rtc` (or set `GO2RTC_PATH`).
+
+To upgrade from a tarball built with `installer/linux/build-tarball.sh`:
+```bash
+sudo argus-update --from dist/argus-1.0.0-linux-x86_64.tar.gz
+```
+
 ### Windows
 
-Download `Argus-Setup-x.x.x.exe` from [Releases](https://github.com/zer0contextlost/argus-nvr/releases) and run it.
+Build the installer (see below), then run `dist\Argus-Setup-x.x.x.exe`. It installs under Program Files, registers a Windows service, and opens TCP 8080 in the firewall.
 
-Argus installs to `C:\Argus\`, registers as a Windows Service (auto-start), opens a firewall rule for port 8080, and launches your browser on completion.
+### First login
 
-**Default credentials:** `admin` / `Screenshot123!` — you are prompted to set a new password on first login.
-
-### Linux
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zer0contextlost/argus-nvr/main/installer/linux/install.sh | sudo bash
-```
-
-Installs to `/opt/argus/`, creates a `argus` system user, writes `/etc/argus/.env`, and enables the `argus` systemd unit.
-
-To upgrade:
-```bash
-sudo argus-update
-```
+**Default credentials:** `admin` / `Screenshot123!`. The API refuses everything except the password-change endpoint until you set a new password. Set `ARGUS_ADMIN_PASSWORD` before first start to skip the default entirely.
 
 ---
 
@@ -90,7 +94,7 @@ sudo argus-update
 ### Backend
 
 ```bash
-cd app
+# from the repo root
 python -m venv .venv
 
 # Windows
@@ -141,7 +145,7 @@ Copy `.env.example` to `.env`. The following variables are recognised:
 
 | Variable | Description | Default |
 |---|---|---|
-| `ARGUS_SECRET_KEY` | JWT signing + Fernet encryption key (base64, 32 bytes) | **required** |
+| `ARGUS_SECRET_KEY` | JWT signing + camera-password encryption key. Generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Changing it later makes stored camera passwords unreadable | **set this** (insecure placeholder otherwise) |
 | `ARGUS_DATA_ROOT` | Root for recordings, events, database, logs | auto-inferred |
 | `ARGUS_HOST` | Bind address | `0.0.0.0` |
 | `ARGUS_PORT` | HTTP port | `8080` |
@@ -153,7 +157,8 @@ Copy `.env.example` to `.env`. The following variables are recognised:
 | `SEGMENT_SECONDS` | Recording segment length | `120` |
 | `RETENTION_MAX_AGE_DAYS` | Delete footage older than N days | `30` |
 | `RETENTION_FREE_SPACE_FLOOR_PCT` | Keep at least N% free on the data drive | `10` |
-| `DETECT_FPS` | Detection frame rate | `2` |
+| `DETECT_FPS` | Detection frame rate | `5` |
+| `RETENTION_MAX_TOTAL_GB` | Hard cap on total recording size (0 = off) | `0` |
 
 Notification settings (Telegram tokens, SMTP credentials, etc.) are stored in the database after first configuration via the Settings page — they do not need to be in `.env`.
 
@@ -171,16 +176,16 @@ Notification settings (Telegram tokens, SMTP credentials, etc.) are stored in th
 
 | Field | Notes |
 |---|---|
-| Camera type | `hikvision` or `wyze` (controls ISAPI alert subscription) |
+| Make / preset | Hikvision cameras get the ISAPI alert subscription; Wyze and generic RTSP presets fill in stream paths |
 | Host | Camera IP address |
 | RTSP user / password | Stored encrypted (Fernet) |
 | Main path / Sub path | RTSP path suffixes — Hikvision defaults: `Streaming/Channels/101` / `102` |
-| Record mode | `continuous`, `motion-only`, or `motion-events` |
-| PTZ capable | Enable to show PTZ controls in live view; set PTZ config JSON (ONVIF URL + profile token) |
+| Record mode | `continuous`, `motion-only`, or `continuous+events` |
+| PTZ capable | Enable to show PTZ controls in live view |
 | Privacy masks | JSON array of `{x, y, w, h}` rectangles (0–1 normalised) to exclude from detection |
 | Arm schedule | JSON array of `{days, start, end}` objects to limit detection hours |
 
-Click **Test connection** before saving to verify RTSP reachability.
+After saving, use **Test** on the camera card to verify RTSP reachability.
 
 ### Hikvision substream recommendation
 
@@ -240,7 +245,7 @@ netsh advfirewall firewall add rule name="Argus NVR WebRTC TCP" dir=in action=al
 netsh advfirewall firewall add rule name="Argus NVR WebRTC UDP" dir=in action=allow protocol=UDP localport=8555
 ```
 
-The Windows installer's `service-install.ps1` adds these rules automatically.
+The Windows installer's `service-install.ps1` only adds the TCP 8080 rule; add the 8555 rules yourself if you need WebRTC from other machines.
 
 Use **Settings > QR Code** to scan the app URL onto a phone without typing.
 
@@ -264,7 +269,7 @@ Install [Tailscale](https://tailscale.com) on the NVR machine and your phone. Ac
 | Web Push | pywebpush (VAPID) |
 | Backend | Python 3.11 + FastAPI + pydantic-settings |
 | Database | SQLite (WAL, schema migrations) |
-| Frontend | React 18 + TypeScript + Vite |
+| Frontend | React 19 + TypeScript + Vite |
 | Live view | WebRTC (trickle ICE via WebSocket) |
 | Windows service | NSSM |
 | Windows installer | Inno Setup 6 |
@@ -276,12 +281,12 @@ Install [Tailscale](https://tailscale.com) on the NVR machine and your phone. Ac
 - All `/api/*` routes require JWT Bearer auth except `GET /api/health`
 - Media endpoints (`/recordings/*/video`, thumbnails, heatmaps, snapshots) also accept `?token=` query param so browser `<video>` and `<img>` elements work without custom headers
 - Camera passwords encrypted at rest (Fernet, key = `ARGUS_SECRET_KEY`)
-- First-run default password (`Screenshot123!`) requires immediate change — the frontend blocks all navigation until the password is changed
+- First-run default password (`Screenshot123!`) must be changed before the API accepts the session for anything else (enforced server-side via a token claim)
 - **Role-based access control** — admin / operator / viewer; user management and audit log are admin-only; destructive operations (purge recordings) require admin
-- **Audit log** — every authentication and mutation is recorded (action, user, IP, timestamp)
+- **Audit log** — logins, password changes, and user management actions are recorded (action, user, IP, timestamp)
 - Webhook notifications signed with HMAC-SHA256 (header `X-Argus-Signature`) — receivers should verify before acting
 - Settings API whitelists recognised keys — arbitrary DB key injection via the settings endpoint is blocked
-- Face embeddings stored as raw numpy float32 bytes (not pickle) — no deserialization RCE risk
+- Face embeddings stored as raw float32 bytes and never unpickled
 - Do not expose port 8080 to the public internet — use Tailscale or a reverse proxy with TLS
 
 ---
@@ -290,7 +295,9 @@ Install [Tailscale](https://tailscale.com) on the NVR machine and your phone. Ac
 
 - **Two-way audio is not implemented.** The live player only opens a receive-only audio channel. A real implementation needs a manufacturer-specific back-channel (e.g. Hikvision's ISAPI `TwoWayAudio` endpoints) and won't work uniformly across mixed camera brands — Wyze, for example, uses its own proprietary protocol for talk-back rather than RTSP/ONVIF.
 - **Hikvision ISAPI motion alerts require firmware support.** Some models/firmwares don't expose the `alertStream` endpoint at all; the subscriber detects this (persistent 404s) and backs off automatically. Frame-diff motion detection still runs normally on those cameras — you just lose the faster ISAPI-triggered recording start.
-- **ONVIF PTZ/discovery/output** assumes reasonably standards-compliant camera firmware; very old devices may not respond correctly to all SOAP calls.
+- **Not implemented yet** (settings exist but nothing reads them): ONVIF output (re-exposing cameras as ONVIF sources) and scheduled cloud backup.
+- **No automated test suite** in this repo.
+- **ONVIF PTZ/discovery** assumes reasonably standards-compliant camera firmware; very old devices may not respond correctly to all SOAP calls.
 
 ---
 

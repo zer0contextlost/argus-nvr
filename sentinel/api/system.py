@@ -25,6 +25,8 @@ from sentinel.util.logging import get_logger
 
 log = get_logger("sentinel.api.system")
 router = APIRouter(prefix="/system", tags=["system"])
+# Routes loaded by browser <img> tags (mounted with ?token= auth in main.py).
+media_router = APIRouter(prefix="/system", tags=["system"])
 
 _start_time = time.time()
 
@@ -294,7 +296,7 @@ async def camera_health() -> dict:
     return {"cameras": result}
 
 
-@router.get("/qr")
+@media_router.get("/qr")
 async def generate_qr(url: str = "") -> object:
     """
     Generate a QR code PNG for the given URL (defaults to the app's base URL).

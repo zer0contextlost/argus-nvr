@@ -217,6 +217,7 @@ app.add_middleware(
 # --- API routers ------------------------------------------------------------
 from sentinel.api.auth import router as auth_router
 from sentinel.api.system import router as system_router
+from sentinel.api.system import media_router as system_media_router
 from sentinel.api.cameras import router as cameras_router
 from sentinel.api.live import router as live_router
 from sentinel.api.recordings import router as recordings_router
@@ -243,6 +244,8 @@ _auth_dep = [Depends(get_current_user)]
 _auth_dep_flex = [Depends(get_current_user_flexible)]
 
 app.include_router(system_router, prefix="/api", dependencies=_auth_dep)
+# QR code PNG — needs ?token= query auth so the Settings page <img> can load it.
+app.include_router(system_media_router, prefix="/api", dependencies=_auth_dep_flex)
 app.include_router(cameras_router, prefix="/api", dependencies=_auth_dep)
 # Snapshot route — needs ?token= query auth so browser <img> tags can use it.
 app.include_router(cameras_media_router, prefix="/api", dependencies=_auth_dep_flex)

@@ -87,22 +87,14 @@ def load_cache_from_db(db) -> None:
         for row in rows:
             try:
                 blob = bytes(row["encoding"])
-                # New format: raw float32 bytes. Legacy format: pickle blob.
-                # Try raw bytes first; fall back to pickle for old rows.
+                # Raw float32 bytes. Rows in any other format are skipped
+                # (never unpickled).
                 if len(blob) % 4 == 0 and len(blob) >= 4:
                     enc = np.frombuffer(blob, dtype=np.float32).copy()
                     if enc.ndim == 1 and enc.shape[0] >= 64:
                         _cached_encodings.append(enc)
                         _cached_person_ids.append(row["person_id"])
                         _cached_enc_ids.append(row["id"])
-                        continue
-                # Legacy pickle path — safe here because it's read-once at startup
-                # from our own DB; new enrollments always write raw bytes.
-                import pickle
-                enc = pickle.loads(blob)  # noqa: S301
-                _cached_encodings.append(enc)
-                _cached_person_ids.append(row["person_id"])
-                _cached_enc_ids.append(row["id"])
             except Exception:
                 pass
     log.info("[recognition] cache loaded: %d encoding(s)", len(_cached_encodings))

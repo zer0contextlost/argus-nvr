@@ -14,7 +14,7 @@ SERVICE_NAME="argus"
 ARGUS_USER="argus"
 
 # Update this URL when a new release is published.
-RELEASE_URL="https://github.com/your-org/argus-nvr/releases/latest/download/argus-linux-x86_64.tar.gz"
+RELEASE_URL="https://github.com/zer0contextlost/argus-nvr/releases/latest/download/argus-linux-x86_64.tar.gz"
 
 TARBALL=""
 if [[ "${1:-}" == "--from" && -n "${2:-}" ]]; then

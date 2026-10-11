@@ -5,7 +5,7 @@
 
 import { useState, FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { authApi, setMustChangePassword } from '../api/client'
+import { authApi, setMustChangePassword, setToken } from '../api/client'
 
 function ShieldLogo() {
   return (
@@ -44,7 +44,9 @@ export function ChangePasswordPage() {
     setError('')
     setLoading(true)
     try {
-      await authApi.changePassword(current, next)
+      const res = await authApi.changePassword(current, next)
+      // The pre-change token is only accepted by /auth/*; swap in the new one.
+      if (res.access_token) setToken(res.access_token)
       setMustChangePassword(false)
       navigate('/live', { replace: true })
     } catch (err: unknown) {

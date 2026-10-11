@@ -488,7 +488,7 @@ export const authApi = {
   me: () => request<CurrentUser>('GET', '/auth/me'),
 
   changePassword: (currentPassword: string, newPassword: string) =>
-    request<{ message: string }>('PUT', '/auth/password', {
+    request<{ message: string; access_token?: string }>('PUT', '/auth/password', {
       current_password: currentPassword,
       new_password: newPassword,
     }),

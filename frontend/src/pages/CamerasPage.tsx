@@ -613,7 +613,7 @@ function FormModal({ form, editId, saving, error, onField, onSave, onCancel }: F
 
         {/* Arm schedule */}
         <div style={{ marginTop: 16 }}>
-          <FormField label="Arm schedule (JSON)" help='e.g. [{"start":"22:00","end":"06:00","days":[1,2,3,4,5]}] — leave blank for always armed'>
+          <FormField label="Arm schedule (JSON)" help='e.g. [{"start":"22:00","end":"06:00","days":[0,1,2,3,4]}] (days: 0=Mon … 6=Sun) — leave blank for always armed'>
             <input
               value={(() => { try { return JSON.parse(form.detect_config_json || '{}').arm_schedule ? JSON.stringify(JSON.parse(form.detect_config_json || '{}').arm_schedule) : '' } catch { return '' } })()}
               onChange={e => {

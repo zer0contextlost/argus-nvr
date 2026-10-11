@@ -86,17 +86,10 @@ def _get_embedding_for_event(db, event_id: int):
     if not row["face_embedding"]:
         raise HTTPException(422, f"Event {event_id} has no stored face embedding — was it a face event?")
     raw = row["face_embedding"]
-    try:
-        # New format: raw float32 bytes (512-d = 2048 bytes)
-        if len(raw) == 512 * 4:
-            embedding = np.frombuffer(raw, dtype=np.float32).copy()
-        else:
-            import pickle as _pickle
-            embedding = _pickle.loads(raw)
-    except Exception:
-        import pickle as _pickle
-        embedding = _pickle.loads(raw)
-    return embedding
+    # Stored as raw float32 bytes (512-d = 2048 bytes). Never unpickle DB blobs.
+    if len(raw) != 512 * 4:
+        raise HTTPException(422, f"Event {event_id} has an unrecognised face embedding format")
+    return np.frombuffer(raw, dtype=np.float32).copy()
 
 
 # ---------------------------------------------------------------------------
