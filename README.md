@@ -1,84 +1,62 @@
 # Argus NVR
 
-Self-hosted network video recorder for IP cameras. Motion-triggered recording, WebRTC live view, face recognition, multi-user RBAC, PTZ control, smart search, and a timeline scrubber — with build scripts for a Windows installer and a Linux tarball.
+A self-hosted network video recorder for IP cameras. Argus pulls RTSP streams through [go2rtc](https://github.com/AlexxIT/go2rtc), records with FFmpeg stream-copy, detects motion on the CPU, and serves a React web app with WebRTC live view and a timeline for playback. Everything lives in one SQLite database and one recordings folder. It needs no GPU, no cloud account and no Docker.
 
-Built on FastAPI + React + go2rtc + FFmpeg + SQLite.
+It's a one-person project, built for and run on a single home setup of Hikvision and Wyze cameras. Expect rough edges on other cameras and platforms.
 
----
+## What it does
 
-## Features
+**Live view.** WebRTC grid in 1, 4, 6 or 9 tiles. Each tile can switch between main and sub stream, take a JPEG snapshot, or show a motion heatmap. Double-click a tile for fullscreen. A cycle mode rotates through the cameras for a wall display.
 
-### Recording & Playback
-- **Multi-camera live view** — WebRTC grid (1 / 4 / 6 / 9 layouts), sub-second latency, self-healing reconnect with exponential backoff
-- **Sub-stream toggle** — switch each live tile between main stream (high quality) and sub-stream (low bitrate) without reloading
-- **Motion-triggered recording** — per-camera detection zones, configurable sensitivity, pre/post-motion buffer
-- **Continuous recording** — 24/7 fragmented MP4 via FFmpeg stream-copy (near-zero CPU; crash-safe segments — no footage lost on unexpected shutdown)
-- **Timeline playback** — 24-hour scrubber with event markers, zoom levels (1h / 3h / 6h / 24h), and **hover thumbnail previews** at any point on the timeline
-- **Clip export** — download MP4 clips (the export API also supports a burned-in camera name + timestamp watermark; not yet exposed in the UI)
-- **Snapshot from live view** — one-click JPEG download from any live camera tile
-- **Camera cycle / kiosk mode** — full-screen carousel through all live cameras (configurable dwell time)
+**Recording.** Per camera: `motion-only`, `continuous`, or `continuous+events`. Recording is FFmpeg stream-copy into 2-minute fragmented MP4 segments, so CPU stays low and a segment cut off by a crash or power loss is still playable. Motion clips start with 5 seconds of pre-roll from a rolling buffer.
 
-### Detection & Analysis
-- **Face recognition** — InsightFace buffalo\_sc (512-d ONNX, CPU); name and track persons across cameras
-- **Heatmap overlay** — per-camera motion heatmap accumulated over time; toggle in the live view player; reset via API
-- **Search** — search events by label or camera name; filter by camera, event type, time range, detection score, and whether a recording exists
-- **Hikvision support** — ISAPI alert stream for hardware VMD events (faster than frame-diff)
-- **Wyze support** — via RTSP firmware
+**Motion detection.** Frame differencing on the sub stream with blob filtering. You can set detection zones, privacy masks, sensitivity, and arm schedules (overnight windows work). On Hikvision cameras Argus also subscribes to the ISAPI alert stream, which can start a recording sooner than frame diffing.
 
-### Camera Control
-- **PTZ control** — ONVIF pan/tilt/zoom via in-player D-pad and stop; per-camera enable; operator or admin role required (preset list/go-to exists in the API, no UI yet)
-- **Privacy masks** — define rectangular exclusion zones per camera (stored as JSON, applied in the detection pipeline)
-- **Scheduled arming** — per-camera arm windows (days + start/end, overnight windows supported); detection only runs inside them
+**Playback.** 24-hour scrubber with event markers, 1h/3h/6h/24h zoom and thumbnail previews on hover. Segments are double-buffered, so playback doesn't stall at file boundaries. You can export any range as an MP4.
 
-### Users & Access
-- **Multi-user accounts** — admin / operator / viewer roles; admin creates and manages users via the Users page
-- **Role-based access control** — sensitive operations (purge, user management, audit log) require admin role
-- **Audit log** — logins, password changes, and user create/update/delete/reset are logged with username, IP, and timestamp; paginated viewer with filters and purge
-- **Forced password change** — new users created with `must_change_password=1`; until it's changed, their token is only accepted by the password-change endpoint
+**Events and search.** Event list with thumbnails. Filter by camera, type, time range, score, and whether a recording exists. Optional face recognition (InsightFace on CPU) lets you name people and get person-aware alerts.
 
-### Notifications
-- **Push notifications** — Telegram, ntfy, SMTP email, and HMAC-signed webhook; person-aware alerts. FCM sending is implemented in the backend for a companion mobile app (not included), configured via the `notify_fcm_service_account_json` setting
-- **Web Push / PWA** — VAPID-based browser push notifications; subscribe from the Settings page; requires HTTPS or localhost
+**Notifications.** Telegram, ntfy, SMTP, HMAC-signed webhooks, and browser Web Push. A backend for FCM is included for a companion mobile app, but no app ships in this repo.
 
-### Infrastructure
-- **Cloud backup** — rclone-based sync of the recordings directory to any rclone-supported remote (S3, Backblaze, Google Drive, etc.); triggered manually from Settings (last run status shown; full history via `GET /api/cloud-backup/history`)
-- **QR code** — Settings page shows a scannable QR code for the app URL; useful for onboarding mobile devices
-- **Per-camera retention** — storage retention limit configurable per camera (overrides global `RETENTION_MAX_AGE_DAYS`)
-- **Auto storage retention** — prunes oldest footage by age, free-space floor, and an optional total-size cap (`RETENTION_MAX_TOTAL_GB`)
-- **Camera health dashboard** — per-camera recorder status, detector status, last recording time, and events-per-hour in the Health tab
-- **Windows installer** — Inno Setup build with embedded Python 3.11 and service registration (NSSM)
-- **Linux installer** — bash script, systemd unit, `argus-update` upgrade script
-- **Progressive Web App** — installable on mobile (online only; the service worker doesn't cache)
+**Users.** Admin, operator and viewer roles, an audit log of logins and user changes, and a forced password change on first login that the server enforces.
 
----
+**Storage.** Retention by age, by a free-space floor, by an optional total-size cap, and per camera. The Health page shows recorder and detector status per camera, disk usage, and how many days of footage fit.
 
-## Installation
+**Smaller things.** ONVIF network scan for adding cameras, an ONVIF PTZ pad in live view, manual rclone sync of recordings to any rclone remote, an installable PWA, and a QR code in Settings for opening the app on a phone.
 
-There are no prebuilt releases yet; build from source.
+## Install
+
+There are no prebuilt releases yet. Build from source.
 
 ### Linux (Debian 12/13, Ubuntu 22.04/24.04)
 
 ```bash
+sudo apt install ffmpeg
 git clone https://github.com/zer0contextlost/argus-nvr.git
 cd argus-nvr
-(cd frontend && npm ci && npm run build)   # needs Node.js 20+
+(cd frontend && npm ci && npm run build)   # Node.js 20+
 sudo ./installer/linux/install.sh
 ```
 
-Installs to `/opt/argus/`, creates an `argus` system user, writes `/etc/argus/.env` with a fresh secret key, and enables the `argus` systemd unit. You need FFmpeg (`apt install ffmpeg`) and a [go2rtc](https://github.com/AlexxIT/go2rtc/releases) binary at `/opt/argus/tools/go2rtc` (or set `GO2RTC_PATH`).
+The installer puts the app in `/opt/argus/`, creates an `argus` system user, writes `/etc/argus/.env` with a fresh secret key, and enables the `argus` systemd unit. Put a [go2rtc](https://github.com/AlexxIT/go2rtc/releases) binary at `/opt/argus/tools/go2rtc` (or set `GO2RTC_PATH`), then open `http://<host>:8080`.
 
 To upgrade from a tarball built with `installer/linux/build-tarball.sh`:
+
 ```bash
 sudo argus-update --from dist/argus-1.0.0-linux-x86_64.tar.gz
 ```
 
 ### Windows
 
-Build the installer (see below), then run `dist\Argus-Setup-x.x.x.exe`. It installs under Program Files, registers a Windows service, and opens TCP 8080 in the firewall.
+Build the installer (see [Development setup](#development-setup)) and run `dist\Argus-Setup-x.x.x.exe`. It installs under Program Files, registers a Windows service, and opens TCP 8080 in the firewall.
 
 ### First login
 
-**Default credentials:** `admin` / `Screenshot123!`. The API refuses everything except the password-change endpoint until you set a new password. Set `ARGUS_ADMIN_PASSWORD` before first start to skip the default entirely.
+Username `admin`, password `Screenshot123!`. The API refuses everything except the password-change endpoint until you set a new one. To skip the default entirely, set `ARGUS_ADMIN_PASSWORD` before the first start.
+
+### Hardware
+
+Detection runs on the CPU at 5 fps per camera by default (`DETECT_FPS`). A home setup with a handful of cameras runs comfortably in a 4-core, 4 GB LXC container. Face recognition is optional (`pip install -r requirements-face.txt`, about 500 MB of packages).
 
 ---
 
@@ -113,7 +91,7 @@ uvicorn sentinel.main:app --reload --port 8080
 ```bash
 cd frontend
 npm ci
-npm run dev   # http://localhost:5173 — proxies /api to :8080
+npm run dev   # http://localhost:5173, proxies /api to :8080
 ```
 
 ### Build the Windows installer
@@ -160,7 +138,7 @@ Copy `.env.example` to `.env`. The following variables are recognised:
 | `DETECT_FPS` | Detection frame rate | `5` |
 | `RETENTION_MAX_TOTAL_GB` | Hard cap on total recording size (0 = off) | `0` |
 
-Notification settings (Telegram tokens, SMTP credentials, etc.) are stored in the database after first configuration via the Settings page — they do not need to be in `.env`.
+Notification settings (Telegram tokens, SMTP credentials, etc.) are stored in the database after first configuration via the Settings page, so they don't need to be in `.env`.
 
 ---
 
@@ -179,7 +157,7 @@ Notification settings (Telegram tokens, SMTP credentials, etc.) are stored in th
 | Make / preset | Hikvision cameras get the ISAPI alert subscription; Wyze and generic RTSP presets fill in stream paths |
 | Host | Camera IP address |
 | RTSP user / password | Stored encrypted (Fernet) |
-| Main path / Sub path | RTSP path suffixes — Hikvision defaults: `Streaming/Channels/101` / `102` |
+| Main path / Sub path | RTSP path suffixes. Hikvision defaults: `Streaming/Channels/101` / `102` |
 | Record mode | `continuous`, `motion-only`, or `continuous+events` |
 | PTZ capable | Enable to show PTZ controls in live view |
 | Privacy masks | JSON array of `{x, y, w, h}` rectangles (0–1 normalised) to exclude from detection |
@@ -190,7 +168,7 @@ After saving, use **Test** on the camera card to verify RTSP reachability.
 ### Hikvision substream recommendation
 
 - **Resolution:** 640×360 or 704×480 (low-res is fine for detection)
-- **Encoding:** H.264 (not H.265 — browser WebRTC compatibility)
+- **Encoding:** H.264. Browsers can't play H.265 over WebRTC
 - **Frame rate:** 5–10 fps
 
 ---
@@ -228,7 +206,7 @@ FFmpeg recorder                       Motion detector
         Users · Audit · Settings
 ```
 
-**go2rtc** is reverse-proxied through the app — browsers only ever connect to port 8080. go2rtc's internal ports (1984, 8554, 8555) stay on `127.0.0.1`.
+The app reverse-proxies go2rtc, so browsers only talk to port 8080 for HTTP and signalling. go2rtc's API (1984) and RTSP (8554) ports bind to `127.0.0.1`; its WebRTC media port (8555) has to be reachable by clients.
 
 ---
 
@@ -251,7 +229,7 @@ Use **Settings > QR Code** to scan the app URL onto a phone without typing.
 
 ### Remote / Tailscale (recommended)
 
-Install [Tailscale](https://tailscale.com) on the NVR machine and your phone. Access via the Tailscale IP (`100.x.y.z:8080`) — zero port-forwarding, no public IP exposure.
+Install [Tailscale](https://tailscale.com) on the NVR machine and your phone. Access via the Tailscale IP (`100.x.y.z:8080`). No port forwarding, nothing exposed publicly.
 
 ---
 
@@ -282,12 +260,12 @@ Install [Tailscale](https://tailscale.com) on the NVR machine and your phone. Ac
 - Media endpoints (`/recordings/*/video`, thumbnails, heatmaps, snapshots) also accept `?token=` query param so browser `<video>` and `<img>` elements work without custom headers
 - Camera passwords encrypted at rest (Fernet, key = `ARGUS_SECRET_KEY`)
 - First-run default password (`Screenshot123!`) must be changed before the API accepts the session for anything else (enforced server-side via a token claim)
-- **Role-based access control** — admin / operator / viewer; user management and audit log are admin-only; destructive operations (purge recordings) require admin
-- **Audit log** — logins, password changes, and user management actions are recorded (action, user, IP, timestamp)
-- Webhook notifications signed with HMAC-SHA256 (header `X-Argus-Signature`) — receivers should verify before acting
-- Settings API whitelists recognised keys — arbitrary DB key injection via the settings endpoint is blocked
+- Roles: admin, operator, viewer; user management and audit log are admin-only; destructive operations (purge recordings) require admin
+- Audit log: logins, password changes, and user management actions are recorded (action, user, IP, timestamp)
+- Webhook notifications signed with HMAC-SHA256 (header `X-Argus-Signature`); receivers should verify it
+- Settings API only accepts known keys
 - Face embeddings stored as raw float32 bytes and never unpickled
-- Do not expose port 8080 to the public internet — use Tailscale or a reverse proxy with TLS
+- Don't expose port 8080 to the internet. Use Tailscale, or a reverse proxy with TLS
 
 ---
 
