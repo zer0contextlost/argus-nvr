@@ -251,10 +251,23 @@ class HikvisionAlertSubscriber:
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+def _decrypt_or_none(token: str | None) -> Optional[str]:
+    """Camera password, or None if it can't be decrypted. A subscriber with a
+    wrong password retries against the camera every few seconds and can lock
+    the account, so callers skip the camera instead of sending ""."""
+    from sentinel.util.crypto import decrypt_password
+
+    if not token:
+        return ""
+    try:
+        return decrypt_password(token)
+    except Exception:
+        return None
+
+
 def start_alert_subscribers() -> None:
     """Start ISAPI alert subscribers for all enabled Hikvision cameras."""
     from sentinel.db import get_db
-    from sentinel.util.crypto import decrypt_password
 
     db = get_db()
     cameras = db.execute(
@@ -270,10 +283,10 @@ def start_alert_subscribers() -> None:
             cam_id = cam["id"]
             if cam_id in _subscribers:
                 continue
-            try:
-                password = decrypt_password(cam["rtsp_pass_enc"]) if cam["rtsp_pass_enc"] else ""
-            except Exception:
-                password = ""
+            password = _decrypt_or_none(cam["rtsp_pass_enc"])
+            if password is None:
+                log.error("[hik-alerts cam=%s] can't decrypt camera password (ARGUS_SECRET_KEY changed?); not subscribing", cam_id)
+                continue
 
             sub = HikvisionAlertSubscriber(
                 camera_id=cam_id,
@@ -287,6 +300,46 @@ def start_alert_subscribers() -> None:
             started += 1
 
     log.info("[hik-alerts] started %d alert subscriber(s)", started)
+
+
+def sync_alert_subscriber(camera_id: int) -> None:
+    """Start, restart or stop one camera's subscriber to match its DB row.
+
+    Called after a camera is added, edited or deleted. Leaves a running
+    subscriber alone unless its host or credentials changed.
+    """
+    from sentinel.db import open_db
+
+    conn = open_db()
+    try:
+        cam = conn.execute(
+            "SELECT id, host, rtsp_user, rtsp_pass_enc, cam_make, enabled FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    want: Optional[tuple[str, str, str]] = None
+    if cam is not None and cam["enabled"] and cam["cam_make"] == "hikvision":
+        password = _decrypt_or_none(cam["rtsp_pass_enc"])
+        if password is None:
+            log.error("[hik-alerts cam=%s] can't decrypt camera password; not subscribing", camera_id)
+        else:
+            want = (cam["host"], cam["rtsp_user"], password)
+
+    with _registry_lock:
+        sub = _subscribers.get(camera_id)
+        if sub is not None and want == (sub._host, sub._user, sub._password):
+            return
+        if sub is not None:
+            del _subscribers[camera_id]
+            sub.stop()
+        if want is not None:
+            new = HikvisionAlertSubscriber(
+                camera_id=camera_id, host=want[0], port=80, user=want[1], password=want[2],
+            )
+            new.start()
+            _subscribers[camera_id] = new
 
 
 def stop_alert_subscribers() -> None:

@@ -25,8 +25,8 @@ systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
 rm -f "$SERVICE_FILE"
 systemctl daemon-reload
 
-# Remove update script
-rm -f "$UPDATE_SCRIPT"
+# Remove update script and logrotate config
+rm -f "$UPDATE_SCRIPT" /etc/logrotate.d/argus
 
 # Remove app and tools
 echo "Removing application files..."

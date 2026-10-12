@@ -51,7 +51,7 @@ trap 'rm -rf "$WORK"' EXIT
 say "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv ffmpeg curl ca-certificates libgl1 libglib2.0-0 >/dev/null
+apt-get install -y -qq python3 python3-venv ffmpeg curl ca-certificates logrotate libgl1 libglib2.0-0 >/dev/null
 
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
     || die "Python 3.11+ required, found $(python3 -V 2>&1). Use Debian 12+/Ubuntu 24.04+, or Docker."
@@ -160,6 +160,7 @@ chmod 640 "$CONF_FILE"
 chown -R "$ARGUS_USER:$ARGUS_USER" "$INSTALL_ROOT" "$CONF_DIR"
 
 install -m 644 "$APP_DIR/installer/linux/argus.service" /etc/systemd/system/argus.service
+install -m 644 "$APP_DIR/installer/linux/argus.logrotate" /etc/logrotate.d/argus
 cat > /usr/local/bin/argus-update <<'EOF'
 #!/usr/bin/env bash
 # Upgrade Argus NVR to the latest release (or ARGUS_VERSION=vX.Y.Z).

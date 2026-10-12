@@ -162,6 +162,14 @@ def _apply_camera_changes(
     if camera_id is None:
         return
 
+    # ISAPI alert subscriber: started, restarted on host/credential change,
+    # or stopped on delete/disable. Reads the camera's current DB row.
+    try:
+        from sentinel.services.hikvision_alerts import sync_alert_subscriber
+        sync_alert_subscriber(camera_id)
+    except Exception as exc:
+        log.warning("hik alert sync cam=%s failed: %s", camera_id, exc)
+
     if deleted:
         # Remove recorder and detector for the deleted camera.
         try:

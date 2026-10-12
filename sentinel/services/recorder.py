@@ -1397,9 +1397,19 @@ def get_recorder(camera_id: int) -> "CameraRecorder | None":
 
 def add_recorder(camera_id: int, camera_name: str, record_mode: str) -> None:
     """
-    Start a recorder for a newly added/enabled camera.
-    Idempotent: if already running, does nothing.
+    Start a recorder for a newly added/enabled camera, or restart it if its
+    name or record mode changed. No-op if one is already running as asked.
     """
+    with _registry_lock:
+        old = _recorders.get(camera_id)
+        if old is not None:
+            if (old.camera_name, old.record_mode) == (camera_name, record_mode):
+                return
+            del _recorders[camera_id]
+    if old is not None:
+        # Outside the lock: stop() finalizes and indexes the last segment.
+        old.stop()
+        log.info("[recorder] restarting cam=%s for new settings (mode=%s)", camera_id, record_mode)
     with _registry_lock:
         if camera_id in _recorders:
             return

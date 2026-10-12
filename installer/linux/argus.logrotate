@@ -1,0 +1,17 @@
+# Argus logs the app does not rotate itself (sentinel.log and go2rtc.log are
+# rotated in-app). stdout/stderr are opened by systemd in append mode and the
+# per-camera FFmpeg logs are held open by their processes, hence copytruncate.
+/opt/argus/logs/stdout.log
+/opt/argus/logs/stderr.log
+/opt/argus/logs/prebuffer_cam*.log
+/opt/argus/logs/recorder_cam*.log {
+    daily
+    maxsize 20M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
