@@ -8,8 +8,9 @@ Type=simple
 User=argus
 Group=argus
 WorkingDirectory=/opt/argus/app
-Environment=ARGUS_ENV_FILE=/etc/argus/.env
-ExecStart=/opt/argus/app/venv/bin/python -m uvicorn sentinel.main:app --host 0.0.0.0 --port 8080
+Environment=ARGUS_ENV_FILE=/etc/argus/.env ARGUS_HOST=0.0.0.0 ARGUS_PORT=8080
+EnvironmentFile=-/etc/argus/.env
+ExecStart=/opt/argus/app/venv/bin/python -m uvicorn sentinel.main:app --host ${ARGUS_HOST} --port ${ARGUS_PORT}
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/opt/argus/logs/stdout.log

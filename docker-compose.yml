@@ -1,0 +1,19 @@
+# docker compose up -d   then open http://<host>:8080
+services:
+  argus:
+    image: ghcr.io/zer0contextlost/argus-nvr:latest
+    build: .
+    container_name: argus
+    restart: unless-stopped
+    # Host networking: WebRTC (8555) and ONVIF/SADP camera discovery need it.
+    network_mode: host
+    volumes:
+      - ./argus-data:/data
+      # To keep recordings on a separate disk:
+      # - /mnt/bigdisk/argus:/data/recordings
+    environment:
+      TZ: ${TZ:-UTC}
+      # Uncomment to set the admin password up front instead of the default:
+      # ARGUS_ADMIN_PASSWORD: change-me
+      # RETENTION_MAX_AGE_DAYS: 30
+      # RETENTION_MAX_TOTAL_GB: 0

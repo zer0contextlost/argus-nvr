@@ -56,14 +56,14 @@ pyasn1==0.6.3
 pyasn1_modules==0.4.2
 py-vapid==1.9.2
 pycparser==3.0
-pydantic==2.7.4
+pydantic==2.10.6
 pydantic-settings==2.3.4
-pydantic_core==2.18.4
+pydantic_core==2.27.2
 PyJWT==2.13.0
 pywebpush==1.14.1
 python-dotenv==1.0.1
 python-multipart==0.0.9
-PyYAML==6.0.1
+PyYAML==6.0.2
 qrcode==8.2
 requests==2.34.2
 rich==15.0.0

@@ -26,25 +26,26 @@ It's a one-person project, built for and run on a single home setup of Hikvision
 
 ## Install
 
-There are no prebuilt releases yet. Build from source.
-
-### Linux (Debian 12/13, Ubuntu 22.04/24.04)
+### Linux (Debian 12+, Ubuntu 24.04+, x86_64 or arm64)
 
 ```bash
-sudo apt install ffmpeg
-git clone https://github.com/zer0contextlost/argus-nvr.git
-cd argus-nvr
-(cd frontend && npm ci && npm run build)   # Node.js 20+
-sudo ./installer/linux/install.sh
+curl -fsSL https://raw.githubusercontent.com/zer0contextlost/argus-nvr/main/install.sh | sudo bash
 ```
 
-The installer puts the app in `/opt/argus/`, creates an `argus` system user, writes `/etc/argus/.env` with a fresh secret key, and enables the `argus` systemd unit. Put a [go2rtc](https://github.com/AlexxIT/go2rtc/releases) binary at `/opt/argus/tools/go2rtc` (or set `GO2RTC_PATH`), then open `http://<host>:8080`.
+That one command installs Python, FFmpeg and go2rtc, puts the app in `/opt/argus/`, writes `/etc/argus/.env` with a fresh secret key, starts the `argus` systemd service, and prints the URL. Node.js isn't needed: release tarballs ship with the frontend already built.
 
-To upgrade from a tarball built with `installer/linux/build-tarball.sh`:
+Upgrade with `sudo argus-update`, which runs the same script again. Recordings, the database and `/etc/argus/.env` are kept. To pin a version, use `curl ... | sudo ARGUS_VERSION=v1.2.0 bash`. To install from a git checkout instead, run `sudo ./install.sh` in the checkout (it builds the frontend if `frontend/dist` is missing, which needs Node.js 20+). To remove Argus, run `sudo /opt/argus/app/installer/linux/uninstall.sh`.
+
+Back up `/etc/argus/.env`. The secret key in it also decrypts the stored camera passwords.
+
+### Docker
 
 ```bash
-sudo argus-update --from dist/argus-1.0.0-linux-x86_64.tar.gz
+git clone https://github.com/zer0contextlost/argus-nvr.git && cd argus-nvr
+docker compose up -d
 ```
+
+Data, recordings and the generated secret key go in `./argus-data`. The compose file uses host networking, which WebRTC live view and camera discovery need. To keep recordings on a different disk, mount it at `/data/recordings` (there's a commented example in `docker-compose.yml`). Set `TZ` so recording timestamps match local time.
 
 ### Windows
 
@@ -108,18 +109,15 @@ npm run dev   # http://localhost:5173, proxies /api to :8080
 # Output: dist\Argus-Setup-1.0.0.exe
 ```
 
-### Build the Linux tarball
+### Publish a release
 
-```bash
-bash installer/linux/build-tarball.sh
-# Output: dist/argus-1.0.0-linux-x86_64.tar.gz
-```
+Push a tag (`git tag v1.2.0 && git push origin v1.2.0`). The `release` GitHub Actions workflow builds the frontend, attaches `argus-nvr.tar.gz` to a GitHub release (the file `install.sh` downloads), and pushes a multi-arch image to `ghcr.io/zer0contextlost/argus-nvr`.
 
 ---
 
 ## Configuration
 
-Copy `.env.example` to `.env`. The following variables are recognised:
+The Linux installer reads `/etc/argus/.env`. Docker reads `./argus-data/.env`, and also takes these variables from the `environment:` block in `docker-compose.yml`. For development, copy `.env.example` to `.env`. These variables are recognised:
 
 | Variable | Description | Default |
 |---|---|---|
@@ -135,7 +133,7 @@ Copy `.env.example` to `.env`. The following variables are recognised:
 | `SEGMENT_SECONDS` | Recording segment length | `120` |
 | `RETENTION_MAX_AGE_DAYS` | Delete footage older than N days | `30` |
 | `RETENTION_FREE_SPACE_FLOOR_PCT` | Keep at least N% free on the data drive | `10` |
-| `DETECT_FPS` | Detection frame rate | `5` |
+| `DETECT_FPS` | Detection frame rate | `5` (the Linux installer's `.env` sets `2`) |
 | `RETENTION_MAX_TOTAL_GB` | Hard cap on total recording size (0 = off) | `0` |
 
 Notification settings (Telegram tokens, SMTP credentials, etc.) are stored in the database after first configuration via the Settings page, so they don't need to be in `.env`.

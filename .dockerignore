@@ -1,0 +1,16 @@
+.git
+**/__pycache__
+**/node_modules
+frontend/dist
+.venv
+venv
+.env
+dist
+build
+argus-data
+recordings
+events
+logs
+data
+bin
+tools
