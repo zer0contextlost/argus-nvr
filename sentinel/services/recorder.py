@@ -530,6 +530,12 @@ class SegmentIndexer:
             if f not in seen_set:
                 self._seen_order.append(f)
                 seen_set.add(f)
+        # Keep time order. Harvested pre-buffer chunks land after the main
+        # recorder has opened its first segment but carry older names;
+        # appended unsorted, they pushed that still-open segment out of the
+        # "last" slot and it was indexed (and sometimes remuxed in place)
+        # while FFmpeg was still writing it.
+        self._seen_order.sort()
 
         # All files except the last one are considered complete.
         # (The last one may still be open by FFmpeg.)
