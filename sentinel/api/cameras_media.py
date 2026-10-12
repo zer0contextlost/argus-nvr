@@ -46,8 +46,11 @@ async def get_snapshot(camera_id: int):
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(frame_url)
-        if resp.status_code == 200:
+        # go2rtc answers 200 with an empty body when the camera is offline.
+        if resp.status_code == 200 and resp.content.startswith(b"\xff\xd8"):
             return Response(content=resp.content, media_type="image/jpeg")
+        if resp.status_code == 200:
+            raise HTTPException(status_code=503, detail="Camera offline: no frame available")
         raise HTTPException(
             status_code=502,
             detail=f"go2rtc returned HTTP {resp.status_code} — stream may not be up yet",

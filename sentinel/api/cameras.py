@@ -655,6 +655,23 @@ async def _sync_time_onvif(host: str, user: str, password: str, now) -> tuple[bo
         return False, f"ONVIF error: {exc}"
 
 
+async def _isapi_time_mode(host: str, user: str, password: str) -> Optional[str]:
+    """The camera's ISAPI timeMode ("NTP", "manual", ...), or None if unreadable."""
+    import re
+    url = f"http://{host}/ISAPI/System/time"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, auth=(user, password))
+            if resp.status_code == 401:
+                resp = await client.get(url, auth=httpx.DigestAuth(user, password))
+        if resp.status_code != 200:
+            return None
+        m = re.search(r"<timeMode>([^<]*)</timeMode>", resp.text)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 async def _sync_time_isapi(host: str, user: str, password: str, now) -> tuple[bool, str]:
     """Set camera time via Hikvision ISAPI PUT /ISAPI/System/time."""
     url = f"http://{host}/ISAPI/System/time"
@@ -711,6 +728,14 @@ async def sync_camera_time(camera_id: int) -> dict:
 
     now = datetime.now(_tz.utc)
     reasons: list[str] = []
+    is_hikvision = "hikvision" in cam_type or "hikvision" in cam_make
+
+    # Both ONVIF and ISAPI set the clock in manual mode, which would switch off
+    # a camera's own NTP sync. Leave NTP-synced cameras alone.
+    if is_hikvision and (await _isapi_time_mode(host, user, password) or "").lower() == "ntp":
+        log.info("sync-time cam=%s skipped: camera already syncs via NTP", camera_id)
+        return {"ok": True, "method": "camera NTP (already synced, left unchanged)",
+                "utc_time": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
 
     # Try ONVIF first (SOAP 1.1, Digest auth)
     ok, detail = await _sync_time_onvif(host, user, password, now)
@@ -721,7 +746,6 @@ async def sync_camera_time(camera_id: int) -> dict:
     log.debug("sync-time cam=%s ONVIF: %s", camera_id, detail)
 
     # Fall back to Hikvision ISAPI (Digest auth)
-    is_hikvision = "hikvision" in cam_type or "hikvision" in cam_make
     if is_hikvision:
         ok, detail = await _sync_time_isapi(host, user, password, now)
         if ok:

@@ -93,6 +93,10 @@ PREBUFFER_HOUSEKEEPING_INTERVAL_S: float = 30.0
 # camera connection.
 PREBUFFER_HANDOFF_S: float = 6.0
 
+# How far (seconds) a segment's probed duration must exceed its wall-clock
+# write window before the indexer remuxes it with COLLAPSE_TS_JUMPS_BSF.
+TS_JUMP_MIN_EXCESS_S: float = 3.0
+
 # Bitstream filter that collapses video timestamp jumps, used by
 # _repair_timestamp_jumps(). Some cameras' RTP clocks leap forward several
 # seconds on a stream hiccup; with -c:v copy the leap is written into the MP4
@@ -650,7 +654,9 @@ class SegmentIndexer:
             try:
                 mtime_dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
                 wall_s = (mtime_dt - started_at_dt).total_seconds() + 2.0
-                if wall_s > 0 and duration_s > wall_s:
+                # Real jumps are several seconds; sub-second overshoot is
+                # ordinary camera-clock drift and not worth a remux.
+                if wall_s > 0 and duration_s > wall_s + TS_JUMP_MIN_EXCESS_S:
                     probed_s = duration_s
                     if _repair_timestamp_jumps(path):
                         duration_s = _probe_segment(path).get("duration_s") or duration_s
@@ -1081,6 +1087,27 @@ class CameraRecorder:
             sup.stop()
             log.debug("[recorder cam=%s] pre-buffer recorder stopped", self.camera_id)
 
+    def _first_main_segment_start(self, trigger_at: float) -> Optional[float]:
+        """Epoch start of the main recorder's first segment for this trigger,
+        or None if it hasn't written one yet. Segment names are local
+        wall-clock HHMMSS (FFmpeg strftime), same as the pre-buffer's."""
+        starts = []
+        days = {datetime.fromtimestamp(trigger_at).strftime("%Y-%m-%d"),
+                datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")}
+        for day in days:
+            d = self._cam_dir / day
+            if not d.is_dir():
+                continue
+            for f in d.glob("*.mp4"):
+                try:
+                    t = datetime.strptime(f"{day} {f.stem}", "%Y-%m-%d %H%M%S").timestamp()
+                except ValueError:
+                    continue
+                # 1s slack: the trigger is sub-second, segment names are whole seconds.
+                if t >= trigger_at - 1:
+                    starts.append(t)
+        return min(starts) if starts else None
+
     def _collect_prebuffer(
         self,
         include_last: bool = False,
@@ -1109,13 +1136,17 @@ class CameraRecorder:
 
         trigger_at: epoch time of the motion trigger when harvesting after a
         delayed handoff. The pre-roll window is measured back from the trigger
-        rather than from now, and chunks that started after the trigger are
-        dropped since the main recorder already covers that time.
+        rather than from now. Chunks that started after the trigger are kept
+        until the main recorder's first segment begins: FFmpeg takes 2-3s to
+        connect and hit a keyframe, and dropping every post-trigger chunk
+        left that stretch unrecorded. Chunks from the main start onward are
+        dropped as duplicates.
         """
         if not self._prebuffer_dir.exists():
             return
         now = time.time()
         threshold = (trigger_at or now) - settings.motion_pre_buffer_seconds
+        main_start = self._first_main_segment_start(trigger_at) if trigger_at is not None else None
 
         segments = sorted(self._prebuffer_dir.rglob("*.mp4"))
         # Skip the last file only when the pre-buffer FFmpeg may still hold it open.
@@ -1153,7 +1184,9 @@ class CameraRecorder:
                     ).timestamp()  # local time, same as FFmpeg's strftime naming
                 except ValueError:
                     seg_start = None
-                if seg_start is not None and seg_start > trigger_at:
+                if seg_start is not None and seg_start > trigger_at and (
+                    main_start is not None and seg_start >= main_start
+                ):
                     seg.unlink(missing_ok=True)
                     continue
             # Within the pre-buffer window — move to main recordings dir.

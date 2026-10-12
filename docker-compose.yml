@@ -5,6 +5,12 @@ services:
     build: .
     container_name: argus
     restart: unless-stopped
+    # The access log goes to stdout (~10 MB/day); Docker keeps it unbounded by default.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     # Host networking: WebRTC (8555) and ONVIF/SADP camera discovery need it.
     network_mode: host
     volumes:
