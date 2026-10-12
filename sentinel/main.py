@@ -82,9 +82,25 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error("go2rtc failed to start: %s", exc)
 
-    # 4. Give go2rtc a moment to open its RTSP port, then start recorders.
+    # 4. Wait for go2rtc's RTSP port before starting recorders. Pre-buffer
+    # FFmpegs launched earlier fail with "connection refused" and then sit in
+    # supervisor backoff, leaving no pre-roll for the first minute or so.
     import asyncio
-    await asyncio.sleep(2.0)
+    import socket
+    loop = asyncio.get_running_loop()
+    def _rtsp_up() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", settings.go2rtc_rtsp_port), timeout=0.5):
+                return True
+        except OSError:
+            return False
+    for _ in range(40):
+        if await loop.run_in_executor(None, _rtsp_up):
+            break
+        await asyncio.sleep(0.5)
+    else:
+        log.warning("go2rtc RTSP port %s not open after 20s; starting recorders anyway",
+                    settings.go2rtc_rtsp_port)
     try:
         start_recorders()
     except Exception as exc:

@@ -274,19 +274,13 @@ class SegmentIndexer:
         self._preload_indexed()
 
     def _preload_indexed(self) -> None:
+        # Every path the DB knows for this camera. Retention already bounds the
+        # table, and event-linked recordings are kept 90 days, so a 30-day
+        # window left older files to be re-probed on every restart.
         try:
-            from datetime import timedelta
-            # Load only paths from the last 30 days (matching the default retention
-            # window) so the set stays bounded even on long-running deployments.
-            # INSERT OR IGNORE in _insert_segment handles the rare case where an
-            # older-than-30-day file is still on disk and somehow re-scanned.
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
             with self._db_lock:
                 rows = self._db.execute(
-                    "SELECT path FROM recordings WHERE camera_id=? AND started_at >= ?",
-                    (self.camera_id, cutoff),
+                    "SELECT path FROM recordings WHERE camera_id=?", (self.camera_id,)
                 ).fetchall()
             for r in rows:
                 self._indexed.add(Path(r["path"]))
